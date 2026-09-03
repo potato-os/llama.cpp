@@ -340,6 +340,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
+        const struct llama_model * model_shared;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -382,6 +385,10 @@ extern "C" {
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
+
+        // GPU-resident LRU cache for host-offloaded MoE expert weights [EXPERIMENTAL]
+        int32_t  n_moe_cache_slots;   // cache slots per host-resident expert layer (0 = disabled)
+        int32_t  n_moe_cache_inserts; // max expert uploads per layer per decode step
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;

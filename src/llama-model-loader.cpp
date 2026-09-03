@@ -1106,6 +1106,68 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+// declared in llama-model.h, which this file does not include
+const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+
+struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne) {
+    // checked first so no other tensor in any model pays a metadata lookup
+    if (tn.tensor != LLM_TENSOR_TOKEN_EMBD && tn.tensor != LLM_TENSOR_OUTPUT && tn.tensor != LLM_TENSOR_OUTPUT_NORM) {
+        return nullptr;
+    }
+
+    if (shared_target_tensors < 0) {
+        bool shared = false;
+        get_key(LLM_KV_NEXTN_SHARED_TARGET_TENSORS, shared, false);
+        shared_target_tensors = shared ? 1 : 0;
+    }
+    if (shared_target_tensors == 0) {
+        return nullptr;
+    }
+
+    const std::string name = tn.str();
+    if (get_weight(name.c_str()) != nullptr) {
+        return nullptr;
+    }
+
+    if (model_shared == nullptr) {
+        throw std::runtime_error(format("%s: this model is a draft head without its own '%s'; "
+                    "load it as a draft of its target model, not on its own", __func__, name.c_str()));
+    }
+
+    ggml_tensor * src = nullptr;
+    for (const auto & [n, t] : llama_internal_get_tensor_map(model_shared)) {
+        if (n == name) {
+            src = t;
+            break;
+        }
+    }
+    if (src == nullptr) {
+        throw std::runtime_error(format("%s: draft needs tensor '%s' from the target, which does not have it",
+                    __func__, name.c_str()));
+    }
+
+    // used directly, so the shapes must agree exactly
+    size_t dim = 0;
+    for (const int64_t n : ne) {
+        if (dim >= GGML_MAX_DIMS || src->ne[dim] != n) {
+            throw std::runtime_error(format("%s: draft and target disagree on '%s': target has %s, draft wants %s",
+                        __func__, name.c_str(), llama_format_tensor_shape(src).c_str(), llama_format_tensor_shape(ne).c_str()));
+        }
+        dim++;
+    }
+    for (; dim < GGML_MAX_DIMS; dim++) {
+        if (src->ne[dim] != 1) {
+            throw std::runtime_error(format("%s: draft and target disagree on '%s': target has %s, draft wants %s",
+                        __func__, name.c_str(), llama_format_tensor_shape(src).c_str(), llama_format_tensor_shape(ne).c_str()));
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: tensor %s taken from the target model\n", __func__, name.c_str());
+
+    // not counted in n_created/size_data: not in this file, neither allocated nor freed here
+    return src;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1223,6 +1285,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
+        bool buft_overridden = false;
 
         // check overrides
         if (tensor_buft_overrides) {
@@ -1241,6 +1304,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+                        buft_overridden = true;
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
@@ -1259,9 +1323,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        // avoid using a host buffer when using mmap
+        // avoid using a host buffer when using mmap, unless an override asks for it: the tensor is then copied into pinned memory
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (use_mmap && !buft_overridden && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
@@ -1324,6 +1388,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
         return ret;
+    }
+
+    // must precede check_tensor_dims, and must win over the arch fallback that ties output to token_embd
+    if (ggml_tensor * shared = borrow_shared_tensor(tn, ne)) {
+        return shared;
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
@@ -1642,6 +1711,15 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            } else if (ggml_backend_buffer_is_host(cur->buffer)) {
+                // The destination is host memory (e.g. a pinned CUDA_Host buffer selected by -ot), so it can be
+                // filled directly from the file. Copying from the mapping instead would fault in every page one
+                // by one at queue depth 1 - and with --numa distribute the whole mapping carries POSIX_MADV_RANDOM,
+                // which disables readahead entirely. A plain read gets full readahead and is an order of magnitude
+                // faster. Non-host destinations keep the memcpy from the mapping below.
+                const auto & file = files.at(weight->idx);
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(cur->data, n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }

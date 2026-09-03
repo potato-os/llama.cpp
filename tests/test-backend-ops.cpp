@@ -4713,7 +4713,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, bool dup_ids = false) {
     std::random_device rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -4726,6 +4726,14 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
                     data[i] = i % n_mats;
                 }
                 std::shuffle(data.begin(), data.end(), rng);
+                if (dup_ids) {
+                    // repeat the highest expert index in every other slot so that the ids of a token
+                    // are not distinct, as produced by an expert cache that maps all uncached
+                    // experts to the same dummy slot
+                    for (int i = 1; i < t->ne[0]; i += 2) {
+                        data[i] = n_mats - 1;
+                    }
+                }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
         } else {
@@ -4744,9 +4752,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const bool dup_ids; // repeat an expert index within the ids of a token
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, dup_ids);
     }
 
     double max_nmse_err() override {
@@ -4768,9 +4777,9 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool dup_ids = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), dup_ids(dup_ids) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4796,7 +4805,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, dup_ids);
     }
 };
 
@@ -9596,6 +9605,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+
+    // ids of a token that contain the same expert more than once
+    for (bool b : {false, true}) {
+        for (int64_t n_tokens : {1, 2, 4, 8, 32, 512}) {
+            for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 10, b, 256, n_tokens, 256, true));
+            }
+        }
+    }
+    // same, but with an n_expert_used that has no specialized kernel
+    for (int64_t n_tokens : {2, 8, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 5, true, 256, n_tokens, 256, true));
+        }
+    }
+    // quantized types around MMVQ_MAX_BATCH_SIZE, the batch size at which the CUDA
+    // backend switches from mul_mat_vec_q to the batched mul_mat_q path
+    for (bool b : {false, true}) {
+        for (int64_t n_tokens : {8, 9, 12, 16}) {
+            for (ggml_type type_a : {GGML_TYPE_Q6_K, GGML_TYPE_Q5_1, GGML_TYPE_Q4_K}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 10, b, 256, n_tokens, 256, true));
+            }
+        }
+    }
 
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
