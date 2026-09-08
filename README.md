@@ -1,5 +1,7 @@
 # llama.cpp
 
+**Flash-Next experimental fork:** [Top-k update, build instructions, A/B benchmark client and recorded quality results](examples/flashnext-topk/README.md). The fallback comparison requires a build without CUB DeviceTopK; newer DeviceTopK builds ignore the local argsort switch.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
