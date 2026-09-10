@@ -65,3 +65,26 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps
 
 // apply throttled LRU updates; call between graph executions only
 void llama_moe_cache_step();
+
+// Process-global phase transaction. The caller must exclude new graph/context
+// execution AND synchronize all target/draft backends before quiesce() settles
+// remap tables, then destroy every graph reference to cache tensors before
+// release(). These calls
+// do not synchronize schedulers or invalidate CUDA graphs on the caller's behalf.
+//
+// quiesce drains/joins the upload worker and settles all completed admissions.
+// release retains authoritative host weights, capacity, slot/LRU metadata and
+// host tables. restore reloads populated slots from those host weights and only
+// publishes READY after every device group and the worker are ready. Failure
+// leaves the cache disabled; there is no automatic retry or empty-cache fallback.
+enum class llama_moe_cache_phase {
+    unavailable, ready, quiescing, quiescent, released, restoring, failed,
+};
+
+bool llama_moe_cache_quiesce();
+bool llama_moe_cache_release();
+bool llama_moe_cache_restore();
+llama_moe_cache_phase llama_moe_cache_get_phase();
+uint64_t llama_moe_cache_get_generation(); // increments only on successful release/restore
+int32_t llama_moe_cache_get_capacity();
+bool llama_moe_cache_is_active();
