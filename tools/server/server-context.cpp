@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cerrno>  // errno, for strict LLAMA_PHASE_PREFILL_MIN_TOKENS parsing
 #include <cstdio>   // std::rename, for the fail-closed logit dump
 #include <cstdlib>
 #include <cstring>  // std::strcmp, for the phase-boundary reason check
@@ -917,6 +918,7 @@ private:
     int n_empty_consecutive = 0;
 
     uint32_t phase_prefill_ubatch = 0;
+    uint32_t phase_prefill_min_tokens = 0; // env: LLAMA_PHASE_PREFILL_MIN_TOKENS; 0 = no minimum (today's behavior)
     llama_experimental_prefill_mode phase_prefill_mode = LLAMA_EXPERIMENTAL_PREFILL_TRANSACTION;
     std::string phase_prefill_logit_dump;   // directory; empty disables the dump
     bool phase_prefill_dump_pending = false;
@@ -926,6 +928,7 @@ private:
     bool phase_prefill_in_flight = false;
     bool phase_prefill_release_pending = false;
     int phase_prefill_slot = -1;
+    int phase_prefill_decision_task_id = -1; // last task id a DECISION line was logged for
 
     const char * phase_prefill_mode_name() const {
         return phase_prefill_mode == LLAMA_EXPERIMENTAL_PREFILL_BYPASS_ONLY ? "bypass_only" : "transaction";
@@ -1018,6 +1021,7 @@ private:
                  << ",\n  \"fnv1a64\": \"" << std::hex << expect_hash << std::dec << "\""
                  << ",\n  \"phase_prefill_mode\": \"" << phase_prefill_mode_name() << "\""
                  << ",\n  \"phase_prefill_ubatch\": " << phase_prefill_ubatch
+                 << ",\n  \"phase_prefill_min_tokens\": " << phase_prefill_min_tokens
                  << ",\n  \"lookup_cache_enabled\": " << c.lookup_cache_enabled
                  << ",\n  \"obs_hits\": " << c.obs_hits
                  << ",\n  \"obs_misses\": " << c.obs_misses
@@ -1083,6 +1087,21 @@ private:
                 slot.task->params.n_cmpl != 1 || slot.task->is_parent() || slot.task->is_child()) {
             GGML_ABORT("phase prefill received an incompatible task");
         }
+        // pending = prompt tokens this task must still process = total prompt tokens minus the
+        // cached prefix at the START of this prompt; constant over all batches of the same prompt
+        // (slot.stats.n_prompt_cached is assigned exactly once, before the first batch of a prompt
+        // reaches this function, and is not modified again until the next prompt).
+        const int32_t phase_prefill_total  = slot.task->n_tokens();
+        const int32_t phase_prefill_cached = (int32_t) slot.stats.n_prompt_cached;
+        const int32_t phase_prefill_pending = phase_prefill_total - phase_prefill_cached;
+        if (slot.task->id != phase_prefill_decision_task_id) {
+            phase_prefill_decision_task_id = slot.task->id;
+            const bool phase_prefill_taken = view.n_tokens > 8 &&
+                (phase_prefill_min_tokens == 0 || phase_prefill_pending >= (int32_t) phase_prefill_min_tokens);
+            SRV_INF("phase_prefill DECISION slot=%d task=%d pending=%d cached=%d total=%d min_tokens=%u taken=%d\n",
+                    slot.id, slot.task->id, phase_prefill_pending, phase_prefill_cached, phase_prefill_total,
+                    phase_prefill_min_tokens, phase_prefill_taken ? 1 : 0);
+        }
         const bool is_prompt = batch.tokens.front().is_prompt;
         for (const auto & token : batch.tokens) {
             if (token.id_slot != slot.id || token.is_prompt != is_prompt) {
@@ -1099,7 +1118,8 @@ private:
         if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) {
             GGML_ABORT("phase prefill prompt metadata disagrees with slot state");
         }
-        if (!phase_prefill_active && view.n_tokens > 8) {
+        if (!phase_prefill_active && view.n_tokens > 8 &&
+                (phase_prefill_min_tokens == 0 || phase_prefill_pending >= (int32_t) phase_prefill_min_tokens)) {
             const int64_t started = ggml_time_us();
             if (!llama_experimental_prefill_begin(ctx_tgt, ctx_dft, phase_prefill_ubatch, phase_prefill_mode)) {
                 GGML_ABORT("phase prefill begin failed; state is not recoverable");
@@ -1224,13 +1244,40 @@ private:
         const bool has_spec = has_draft || spec_mtp;
 
         phase_prefill_ubatch = 0;
-        if (const char * value = std::getenv("LLAMA_PHASE_PREFILL_UBATCH")) {
-            const std::string requested(value);
-            if (requested != "512" && requested != "2048") {
-                SRV_ERR("%s", "LLAMA_PHASE_PREFILL_UBATCH must be 512 or 2048\n");
+
+        phase_prefill_min_tokens = 0;
+        if (const char * min_tokens_value = std::getenv("LLAMA_PHASE_PREFILL_MIN_TOKENS")) {
+            const std::string requested_min_tokens(min_tokens_value);
+            bool valid = !requested_min_tokens.empty();
+            for (char c : requested_min_tokens) {
+                if (c < '0' || c > '9') { valid = false; break; }
+            }
+            unsigned long long parsed = 0;
+            if (valid) {
+                errno = 0;
+                char * endptr = nullptr;
+                parsed = std::strtoull(requested_min_tokens.c_str(), &endptr, 10);
+                if (errno != 0 || endptr == nullptr || *endptr != '\0') {
+                    valid = false;
+                }
+            }
+            if (valid && parsed != 0 && (parsed < 1ULL || parsed > 1000000000ULL)) {
+                valid = false;
+            }
+            if (!valid) {
+                SRV_ERR("%s", "LLAMA_PHASE_PREFILL_MIN_TOKENS must be unset, 0, or a decimal integer between 1 and 1000000000\n");
                 return false;
             }
-            phase_prefill_ubatch = requested == "512" ? 512 : 2048;
+            phase_prefill_min_tokens = (uint32_t) parsed;
+        }
+
+        if (const char * value = std::getenv("LLAMA_PHASE_PREFILL_UBATCH")) {
+            const std::string requested(value);
+            if (requested != "512" && requested != "2048" && requested != "4096") {
+                SRV_ERR("%s", "LLAMA_PHASE_PREFILL_UBATCH must be 512, 2048 or 4096\n");
+                return false;
+            }
+            phase_prefill_ubatch = requested == "512" ? 512 : requested == "2048" ? 2048 : 4096;
             phase_prefill_mode = LLAMA_EXPERIMENTAL_PREFILL_TRANSACTION;
             if (const char * mode_value = std::getenv("LLAMA_PHASE_PREFILL_MODE")) {
                 const std::string requested_mode(mode_value);

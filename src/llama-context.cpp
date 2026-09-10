@@ -734,6 +734,7 @@ bool llama_context::experimental_prefill_transition(
     static bool failed = false;
     static uint32_t original_tgt = 0, original_dft = 0;
     static uint64_t released_generation = 0;
+    static int32_t began_capacity = 0;
     static llama_experimental_prefill_mode active_mode = LLAMA_EXPERIMENTAL_PREFILL_TRANSACTION;
     std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
@@ -789,19 +790,20 @@ bool llama_context::experimental_prefill_transition(
         if (!target_devices.count(device)) { return fail("draft device is outside the target pair"); }
     }
     if (begin) {
-        if (active || (target_ubatch != 512 && target_ubatch != 2048) ||
+        if (active || (target_ubatch != 512 && target_ubatch != 2048 && target_ubatch != 4096) ||
                 (mode == LLAMA_EXPERIMENTAL_PREFILL_BYPASS_ONLY && target_ubatch != 512) ||
                 tgt->cparams.n_ubatch != 512 || dft->cparams.n_ubatch != 512 ||
                 target_ubatch > tgt->cparams.n_ctx ||
                 llama_moe_cache_get_phase() != llama_moe_cache_phase::ready ||
-                llama_moe_cache_get_capacity() != 150 || !llama_moe_cache_is_active()) {
-            return fail("begin requires ubatch512 pair, requested512/2048 and ready cache150");
+                llama_moe_cache_get_capacity() <= 0 || !llama_moe_cache_is_active()) {
+            return fail("begin requires ubatch512 pair, requested 512/2048/4096 and a ready active cache");
         }
         owner_tgt = tgt;
         owner_dft = dft;
         owner_thread = std::this_thread::get_id();
         original_tgt = tgt->cparams.n_ubatch;
         original_dft = dft->cparams.n_ubatch;
+        began_capacity = llama_moe_cache_get_capacity();
         active = true;
         active_mode = mode;
     } else if (!active) {
@@ -914,8 +916,8 @@ bool llama_context::experimental_prefill_transition(
             }
             if (!begin) {
                 if (!llama_moe_cache_bypass_end() || llama_moe_cache_get_phase() != llama_moe_cache_phase::ready ||
-                        llama_moe_cache_get_capacity() != 150 || !llama_moe_cache_is_active()) {
-                    return fail("cache bypass_end failed");
+                        llama_moe_cache_get_capacity() != began_capacity || !llama_moe_cache_is_active()) {
+                    return fail("cache bypass_end failed: phase/capacity/active");
                 }
             }
             size_t bypass_index = 0;
@@ -955,9 +957,9 @@ bool llama_context::experimental_prefill_transition(
             released_generation = llama_moe_cache_get_generation();
         } else {
             if (!llama_moe_cache_restore() || llama_moe_cache_get_phase() != llama_moe_cache_phase::ready ||
-                    llama_moe_cache_get_capacity() != 150 || !llama_moe_cache_is_active() ||
+                    llama_moe_cache_get_capacity() != began_capacity || !llama_moe_cache_is_active() ||
                     llama_moe_cache_get_generation() != released_generation + 1) {
-                return fail("cache restore failed");
+                return fail("cache restore failed: phase/capacity/active/generation");
             }
         }
         tgt->cparams.n_ubatch = begin ? target_ubatch : original_tgt;
