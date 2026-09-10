@@ -62,6 +62,17 @@ struct moe_cache {
 
     uint64_t clock   = 0;
     uint64_t n_steps = 0;
+    uint64_t n_admit = 0; // diagnostic: expert uploads scheduled, cumulative
+    // Diagnostic counters. Atomic because the observation callback runs on the graph-execution
+    // thread without holding mtx. Relaxed ordering: these are counters, not synchronisation.
+    std::atomic<uint64_t> c_lookup_calls          { 0 };
+    std::atomic<uint64_t> c_lookup_cache_enabled  { 0 };
+    std::atomic<uint64_t> c_lookup_null_not_ready { 0 };
+    std::atomic<uint64_t> c_lookup_null_unmapped  { 0 };
+    std::atomic<uint64_t> c_obs_calls             { 0 };
+    std::atomic<uint64_t> c_obs_skip_batch        { 0 };
+    std::atomic<uint64_t> c_obs_skip_not_ready    { 0 };
+    std::atomic<uint64_t> c_obs_counted           { 0 };
 
     std::mutex mtx; // guards pending lists + clock (observe runs during graph exec)
 
@@ -100,6 +111,21 @@ int parse_layer_from_name(const char * name) {
 
 void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
+    // Diagnostic accounting first, so cache-INELIGIBLE work (a batch larger than
+    // LLAMA_MOE_CACHE_MAX_BATCH, which is every ordinary UB512 prefill ubatch) and PHASE-SUSPENDED
+    // work (released or bypassed) are attributed separately instead of collapsing into one early
+    // return. This is executed work: the callback is global (ggml_set_moe_obs_callback) and fires
+    // for every MoE ids tensor regardless of whether a cache chain was built.
+    {
+        const int64_t n_tokens_obs = ids->ne[1];
+        mc->c_obs_calls.fetch_add(1, std::memory_order_relaxed);
+        if (n_tokens_obs > LLAMA_MOE_CACHE_MAX_BATCH) {
+            mc->c_obs_skip_batch.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (mc->phase.load() != llama_moe_cache_phase::ready) {
+            mc->c_obs_skip_not_ready.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (mc->phase.load() != llama_moe_cache_phase::ready) {
         return; // includes short (<=8 token) tails during the entire suspended phase
     }
@@ -127,6 +153,7 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     if (mc->phase.load() != llama_moe_cache_phase::ready) {
         return;
     }
+    mc->c_obs_counted.fetch_add(1, std::memory_order_relaxed);
     for (int64_t t = 0; t < n_tokens; ++t) {
         for (int64_t i = 0; i < n_ids; ++i) {
             const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
@@ -528,13 +555,24 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
 }
 
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps) {
-    if (!g_cache || g_cache->phase.load() != llama_moe_cache_phase::ready) {
+    // GRAPH CONSTRUCTION ONLY. llama-graph.cpp calls this while building a graph, and only for
+    // batches of at most LLAMA_MOE_CACHE_MAX_BATCH tokens. These counters therefore describe graph
+    // topology decisions and must never be reported as executed expert accesses; a reused graph
+    // performs no lookup at all.
+    if (!g_cache) {
+        return nullptr;
+    }
+    g_cache->c_lookup_calls.fetch_add(1, std::memory_order_relaxed);
+    if (g_cache->phase.load() != llama_moe_cache_phase::ready) {
+        g_cache->c_lookup_null_not_ready.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
     auto it = g_cache->by_up_src.find(up_exps);
     if (it == g_cache->by_up_src.end()) {
+        g_cache->c_lookup_null_unmapped.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
+    g_cache->c_lookup_cache_enabled.fetch_add(1, std::memory_order_relaxed);
     return &g_cache->layers[it->second].pub;
 }
 
@@ -593,6 +631,7 @@ void llama_moe_cache_step() {
             ls.expert_in_flight[id] = true;
 
             std::lock_guard<std::mutex> wlk(mc->wmtx);
+            mc->n_admit++;
             mc->todo.push_back({li, id, slot});
         }
         ls.pending.clear();
@@ -604,6 +643,68 @@ void llama_moe_cache_step() {
         for (auto & ls : mc->layers) { h += ls.n_hit; m += ls.n_miss; }
         LLAMA_LOG_INFO("moe-cache: steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " hit-rate=%.1f%%\n",
                 mc->n_steps, h, m, h + m ? 100.0*h/(h + m) : 0.0);
+    }
+}
+
+bool llama_moe_cache_bypass_begin() {
+    std::lock_guard<std::mutex> lifecycle_lock(g_init_mtx);
+    moe_cache * mc = g_cache;
+    // Same precondition as release(): the caller has excluded graph execution, synchronized every
+    // backend and quiesced the cache. Nothing is freed here. The caller MUST additionally
+    // invalidate reusable graph results; see the hazard note in llama-moecache.h.
+    if (!mc || mc->phase.load() != llama_moe_cache_phase::quiescent || mc->worker.joinable()) {
+        return cache_fail(mc, "bypass_begin requires a joined/quiescent cache and caller graph barrier");
+    }
+    if (!metadata_valid(mc)) {
+        return cache_fail(mc, "bypass_begin metadata invariant");
+    }
+    mc->phase.store(llama_moe_cache_phase::bypassed);
+    log_transition(mc, "bypass_begin", "bypassed");
+    return true;
+}
+
+bool llama_moe_cache_bypass_end() {
+    std::lock_guard<std::mutex> lifecycle_lock(g_init_mtx);
+    moe_cache * mc = g_cache;
+    if (!mc || mc->phase.load() != llama_moe_cache_phase::bypassed || mc->worker.joinable()) {
+        return cache_fail(mc, "bypass_end requires the bypassed cache");
+    }
+    if (!metadata_valid(mc)) {
+        return cache_fail(mc, "bypass_end metadata invariant");
+    }
+    if (!start_worker(mc)) {
+        return cache_fail(mc, "bypass_end worker restart failed");
+    }
+    mc->phase.store(llama_moe_cache_phase::ready);
+    log_transition(mc, "bypass_end", "ready");
+    return true;
+}
+
+void llama_moe_cache_get_counters(llama_moe_cache_counter_set * out) {
+    if (!out) {
+        return;
+    }
+    *out = llama_moe_cache_counter_set{};
+    moe_cache * mc = g_cache;
+    if (!mc) {
+        return;
+    }
+    out->lookup_calls              = mc->c_lookup_calls.load(std::memory_order_relaxed);
+    out->lookup_cache_enabled      = mc->c_lookup_cache_enabled.load(std::memory_order_relaxed);
+    out->lookup_null_not_ready     = mc->c_lookup_null_not_ready.load(std::memory_order_relaxed);
+    out->lookup_null_unmapped      = mc->c_lookup_null_unmapped.load(std::memory_order_relaxed);
+    out->obs_calls                 = mc->c_obs_calls.load(std::memory_order_relaxed);
+    out->obs_skip_batch_ineligible = mc->c_obs_skip_batch.load(std::memory_order_relaxed);
+    out->obs_skip_not_ready        = mc->c_obs_skip_not_ready.load(std::memory_order_relaxed);
+    out->obs_counted               = mc->c_obs_counted.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(mc->mtx);
+        uint64_t h = 0, m = 0;
+        for (const auto & ls : mc->layers) { h += ls.n_hit; m += ls.n_miss; }
+        out->obs_hits   = h;
+        out->obs_misses = m;
+        out->admissions = mc->n_admit;
+        out->steps      = mc->n_steps;
     }
 }
 

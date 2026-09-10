@@ -58,7 +58,8 @@ struct llama_context {
     void synchronize();
 
     static bool experimental_prefill_transition(
-            llama_context * ctx_tgt, llama_context * ctx_dft, uint32_t target_ubatch, bool begin);
+            llama_context * ctx_tgt, llama_context * ctx_dft, uint32_t target_ubatch, bool begin,
+            llama_experimental_prefill_mode mode);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;

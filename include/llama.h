@@ -580,8 +580,51 @@ extern "C" {
     // Begin before the first pure prompt batch; end after final MTP catch-up and before sampling.
     // Changes physical compute capacity only; logical n_batch and sequence state are retained.
     // target_ubatch must be 512 (control) or 2048. Any false result requires process restart.
+    // Diagnostic mode for the experimental prefill boundary.
+    //   TRANSACTION: the existing behaviour - quiesce, release device cache backing and compute
+    //                workspaces, then reallocate and restore before decode.
+    //   BYPASS_ONLY: the SAME quiesce/settle at the SAME boundaries with cache lookup, observation
+    //                and admission disabled, but every cache allocation, compute workspace and
+    //                scheduler retained, and no release, reallocation or restoration performed.
+    // BYPASS_ONLY additionally invalidates reusable graph results at both boundaries; see
+    // llama-moecache.h for why that is required rather than optional. It relaxes no correctness
+    // requirement, defines no numerical tolerance, and requires target_ubatch == 512.
+    enum llama_experimental_prefill_mode {
+        LLAMA_EXPERIMENTAL_PREFILL_TRANSACTION = 0,
+        LLAMA_EXPERIMENTAL_PREFILL_BYPASS_ONLY = 1,
+    };
+
     LLAMA_API bool llama_experimental_prefill_begin(
-            struct llama_context * ctx_tgt, struct llama_context * ctx_dft, uint32_t target_ubatch);
+            struct llama_context * ctx_tgt, struct llama_context * ctx_dft, uint32_t target_ubatch,
+            enum llama_experimental_prefill_mode mode);
+
+    // Diagnostic MoE expert-cache counters, cumulative since process start and never reset by a
+    // phase transition. Records measured activity only; gates nothing and defines no tolerance.
+    //
+    // IMPORTANT: the lookup_* counters count GRAPH CONSTRUCTION decisions, not executed expert
+    // accesses. A reused graph performs no lookup. The obs_* counters come from the global MoE
+    // observation callback and therefore do count executions, including batches that are
+    // cache-ineligible because they exceed LLAMA_MOE_CACHE_MAX_BATCH (8) tokens - which is every
+    // ordinary UB512 prefill ubatch.
+    struct llama_moe_cache_counters {
+        // graph construction (llama_moe_cache_lookup)
+        uint64_t lookup_calls;            // lookup invoked from graph build
+        uint64_t lookup_cache_enabled;    // returned a layer -> graph built WITH the cache chain
+        uint64_t lookup_null_not_ready;   // returned null because the cache phase was not READY
+        uint64_t lookup_null_unmapped;    // returned null because this tensor has no cached layer
+        // graph execution (global observation callback)
+        uint64_t obs_calls;               // callback invocations
+        uint64_t obs_skip_batch_ineligible; // n_tokens > LLAMA_MOE_CACHE_MAX_BATCH (prefill ubatches)
+        uint64_t obs_skip_not_ready;      // cache phase not READY (released, bypassed, quiescent)
+        uint64_t obs_counted;             // invocations that reached hit/miss accounting
+        uint64_t obs_hits;                // actual observed cached expert accesses
+        uint64_t obs_misses;              // actual observed uncached expert accesses
+        // admission activity
+        uint64_t admissions;              // expert uploads scheduled
+        uint64_t steps;                   // llama_moe_cache_step invocations that did work
+    };
+
+    LLAMA_API void llama_experimental_moe_cache_counters(struct llama_moe_cache_counters * out);
     LLAMA_API bool llama_experimental_prefill_end(
             struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);

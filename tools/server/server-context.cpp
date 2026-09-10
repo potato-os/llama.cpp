@@ -20,7 +20,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdio>   // std::rename, for the fail-closed logit dump
 #include <cstdlib>
+#include <cstring>  // std::strcmp, for the phase-boundary reason check
+#include <vector>   // read-back buffer for logit dump verification
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -914,10 +917,128 @@ private:
     int n_empty_consecutive = 0;
 
     uint32_t phase_prefill_ubatch = 0;
+    llama_experimental_prefill_mode phase_prefill_mode = LLAMA_EXPERIMENTAL_PREFILL_TRANSACTION;
+    std::string phase_prefill_logit_dump;   // directory; empty disables the dump
+    bool phase_prefill_dump_pending = false;
+    int  phase_prefill_dump_ok      = 0;    // dumps written and verified complete
+    int  phase_prefill_dump_failed  = 0;    // dumps attempted that did not verify
     bool phase_prefill_active = false;
     bool phase_prefill_in_flight = false;
     bool phase_prefill_release_pending = false;
     int phase_prefill_slot = -1;
+
+    const char * phase_prefill_mode_name() const {
+        return phase_prefill_mode == LLAMA_EXPERIMENTAL_PREFILL_BYPASS_ONLY ? "bypass_only" : "transaction";
+    }
+
+    // Diagnostic evidence: measured cache activity at each phase boundary. Records only.
+    // lookup_* are GRAPH CONSTRUCTION decisions, obs_* are executions; see llama.h.
+    void phase_prefill_log_counters(const char * boundary) {
+        llama_moe_cache_counters c = {};
+        llama_experimental_moe_cache_counters(&c);
+        SRV_INF("phase_prefill counters boundary=%s mode=%s lookup_calls=%" PRIu64
+                " lookup_cache_enabled=%" PRIu64 " lookup_null_not_ready=%" PRIu64
+                " lookup_null_unmapped=%" PRIu64 " obs_calls=%" PRIu64
+                " obs_skip_batch_ineligible=%" PRIu64 " obs_skip_not_ready=%" PRIu64
+                " obs_counted=%" PRIu64 " obs_hits=%" PRIu64 " obs_misses=%" PRIu64
+                " admissions=%" PRIu64 " steps=%" PRIu64 "\n",
+                boundary, phase_prefill_mode_name(), c.lookup_calls, c.lookup_cache_enabled,
+                c.lookup_null_not_ready, c.lookup_null_unmapped, c.obs_calls,
+                c.obs_skip_batch_ineligible, c.obs_skip_not_ready, c.obs_counted, c.obs_hits,
+                c.obs_misses, c.admissions, c.steps);
+    }
+
+    // Diagnostic evidence: the COMPLETE first post-prefill logit vector and its token position.
+    // FAILS CLOSED. The pending flag is cleared only after the bytes are written, flushed, closed,
+    // read back, length-checked and checksum-matched. A failed attempt leaves a ".partial" file and
+    // writes no sidecar, so an incomplete dump can never be mistaken for a complete one, and
+    // increments phase_prefill_dump_failed so the arm can be invalidated offline.
+    // Diagnostic only: full-vector comparison does not replace the correctness gate.
+    void phase_prefill_dump_logits(llama_context * ctx, int tok_idx, int slot_id, int n_prompt_tokens) {
+        if (phase_prefill_logit_dump.empty() || !phase_prefill_dump_pending) {
+            return;
+        }
+        const std::string stem = phase_prefill_logit_dump + "/slot" + std::to_string(slot_id) +
+                                 "-pos" + std::to_string(n_prompt_tokens);
+        const std::string partial = stem + ".logits.f32.partial";
+        auto dump_failed = [&](const char * why) {
+            phase_prefill_dump_failed++;
+            phase_prefill_dump_pending = false;   // one attempt per request; never silently retried
+            SRV_ERR("phase_prefill logit dump FAILED (%s): %s\n", why, partial.c_str());
+        };
+        const float * logits = llama_get_logits_ith(ctx, tok_idx);
+        if (logits == nullptr) { dump_failed("no logits available"); return; }
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        if (n_vocab <= 0) { dump_failed("invalid vocab size"); return; }
+        const size_t expect_bytes = (size_t) n_vocab * sizeof(float);
+        auto fnv1a64 = [](const unsigned char * data, size_t size) {
+            uint64_t hash = UINT64_C(14695981039346656037);
+            for (size_t i = 0; i < size; ++i) { hash = (hash ^ data[i]) * UINT64_C(1099511628211); }
+            return hash;
+        };
+        const uint64_t expect_hash = fnv1a64(reinterpret_cast<const unsigned char *>(logits), expect_bytes);
+        {
+            std::ofstream raw(partial, std::ios::binary | std::ios::trunc);
+            if (!raw.is_open()) { dump_failed("cannot open output"); return; }
+            raw.write(reinterpret_cast<const char *>(logits), (std::streamsize) expect_bytes);
+            if (!raw.good()) { dump_failed("write error"); return; }
+            raw.flush();
+            if (!raw.good()) { dump_failed("flush error"); return; }
+            raw.close();
+            if (raw.fail()) { dump_failed("close error"); return; }
+        }
+        // Read back and verify: exact byte length and matching checksum, or the dump does not count.
+        std::vector<char> check(expect_bytes);
+        {
+            std::ifstream verify(partial, std::ios::binary);
+            if (!verify.is_open()) { dump_failed("cannot reopen for verification"); return; }
+            verify.read(check.data(), (std::streamsize) expect_bytes);
+            if ((size_t) verify.gcount() != expect_bytes) { dump_failed("short read on verification"); return; }
+            char extra = 0;
+            verify.read(&extra, 1);
+            if (verify.gcount() != 0) { dump_failed("file longer than expected"); return; }
+        }
+        if (fnv1a64(reinterpret_cast<const unsigned char *>(check.data()), expect_bytes) != expect_hash) {
+            dump_failed("checksum mismatch on read-back");
+            return;
+        }
+        llama_moe_cache_counters c = {};
+        llama_experimental_moe_cache_counters(&c);
+        const std::string meta_path = stem + ".logits.json";
+        {
+            std::ofstream meta(meta_path, std::ios::trunc);
+            if (!meta.is_open()) { dump_failed("cannot open sidecar"); return; }
+            meta << "{\n  \"slot_id\": " << slot_id
+                 << ",\n  \"logit_index\": " << tok_idx
+                 << ",\n  \"n_prompt_tokens\": " << n_prompt_tokens
+                 << ",\n  \"first_generated_position\": " << n_prompt_tokens
+                 << ",\n  \"n_vocab\": " << n_vocab
+                 << ",\n  \"bytes\": " << expect_bytes
+                 << ",\n  \"dtype\": \"float32\",\n  \"byte_order\": \"little_endian\""
+                 << ",\n  \"fnv1a64\": \"" << std::hex << expect_hash << std::dec << "\""
+                 << ",\n  \"phase_prefill_mode\": \"" << phase_prefill_mode_name() << "\""
+                 << ",\n  \"phase_prefill_ubatch\": " << phase_prefill_ubatch
+                 << ",\n  \"lookup_cache_enabled\": " << c.lookup_cache_enabled
+                 << ",\n  \"obs_hits\": " << c.obs_hits
+                 << ",\n  \"obs_misses\": " << c.obs_misses
+                 << ",\n  \"obs_skip_batch_ineligible\": " << c.obs_skip_batch_ineligible
+                 << ",\n  \"obs_skip_not_ready\": " << c.obs_skip_not_ready
+                 << ",\n  \"note\": \"Complete first post-prefill logit vector. Diagnostic evidence; "
+                    "full-vector comparison does not replace the correctness gate.\"\n}\n";
+            meta.flush();
+            if (!meta.good()) { dump_failed("sidecar write error"); return; }
+            meta.close();
+            if (meta.fail()) { dump_failed("sidecar close error"); return; }
+        }
+        if (std::rename(partial.c_str(), (stem + ".logits.f32").c_str()) != 0) {
+            dump_failed("rename to final name failed");
+            return;
+        }
+        phase_prefill_dump_pending = false;
+        phase_prefill_dump_ok++;
+        SRV_INF("phase_prefill logit dump verified: %s.logits.f32 bytes=%zu n_vocab=%d position=%d dumps_ok=%d dumps_failed=%d\n",
+                stem.c_str(), expect_bytes, n_vocab, n_prompt_tokens, phase_prefill_dump_ok, phase_prefill_dump_failed);
+    }
 
     void phase_prefill_end(const char * reason) {
         if (!phase_prefill_active) {
@@ -930,8 +1051,13 @@ private:
         if (!llama_experimental_prefill_end(ctx_tgt, ctx_dft)) {
             GGML_ABORT("phase prefill end failed; state is not recoverable");
         }
-        SRV_INF("phase_prefill END slot=%d target_ubatch=%u reason=%s transition_us=%" PRId64 "\n",
-                phase_prefill_slot, phase_prefill_ubatch, reason, ggml_time_us() - started);
+        SRV_INF("phase_prefill END slot=%d target_ubatch=%u mode=%s reason=%s transition_us=%" PRId64 "\n",
+                phase_prefill_slot, phase_prefill_ubatch, phase_prefill_mode_name(), reason,
+                ggml_time_us() - started);
+        phase_prefill_log_counters("end");
+        if (std::strcmp(reason, "prompt_done") == 0) {
+            phase_prefill_dump_pending = true;
+        }
         phase_prefill_active = false;
         phase_prefill_release_pending = false;
         phase_prefill_slot = -1;
@@ -975,13 +1101,14 @@ private:
         }
         if (!phase_prefill_active && view.n_tokens > 8) {
             const int64_t started = ggml_time_us();
-            if (!llama_experimental_prefill_begin(ctx_tgt, ctx_dft, phase_prefill_ubatch)) {
+            if (!llama_experimental_prefill_begin(ctx_tgt, ctx_dft, phase_prefill_ubatch, phase_prefill_mode)) {
                 GGML_ABORT("phase prefill begin failed; state is not recoverable");
             }
             phase_prefill_active = true;
             phase_prefill_slot = slot.id;
-            SRV_INF("phase_prefill BEGIN slot=%d target_ubatch=%u transition_us=%" PRId64 "\n",
-                    slot.id, phase_prefill_ubatch, ggml_time_us() - started);
+            SRV_INF("phase_prefill BEGIN slot=%d target_ubatch=%u mode=%s transition_us=%" PRId64 "\n",
+                    slot.id, phase_prefill_ubatch, phase_prefill_mode_name(), ggml_time_us() - started);
+            phase_prefill_log_counters("begin");
         }
     }
 
@@ -1104,6 +1231,23 @@ private:
                 return false;
             }
             phase_prefill_ubatch = requested == "512" ? 512 : 2048;
+            phase_prefill_mode = LLAMA_EXPERIMENTAL_PREFILL_TRANSACTION;
+            if (const char * mode_value = std::getenv("LLAMA_PHASE_PREFILL_MODE")) {
+                const std::string requested_mode(mode_value);
+                if (requested_mode == "bypass") {
+                    if (phase_prefill_ubatch != 512) {
+                        SRV_ERR("%s", "LLAMA_PHASE_PREFILL_MODE=bypass requires LLAMA_PHASE_PREFILL_UBATCH=512\n");
+                        return false;
+                    }
+                    phase_prefill_mode = LLAMA_EXPERIMENTAL_PREFILL_BYPASS_ONLY;
+                } else if (requested_mode != "transaction") {
+                    SRV_ERR("%s", "LLAMA_PHASE_PREFILL_MODE must be transaction or bypass\n");
+                    return false;
+                }
+            }
+            if (const char * dump_dir = std::getenv("LLAMA_PHASE_PREFILL_LOGIT_DUMP")) {
+                phase_prefill_logit_dump = dump_dir;
+            }
             const auto & spec_types = params_base.speculative.types;
             const bool phase_mtp_only =
                 std::count(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == 1 &&
@@ -3963,6 +4107,8 @@ private:
 
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
+
+            phase_prefill_dump_logits(slot.ctx_tgt, tok_idx, slot.id, (int) slot.prompt.n_tokens());
 
             llama_token id;
             {

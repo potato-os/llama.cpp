@@ -722,7 +722,8 @@ void llama_context::sched_reserve() {
 }
 
 bool llama_context::experimental_prefill_transition(
-        llama_context * tgt, llama_context * dft, uint32_t target_ubatch, bool begin) {
+        llama_context * tgt, llama_context * dft, uint32_t target_ubatch, bool begin,
+        llama_experimental_prefill_mode mode) {
     // This process-global cache experiment deliberately supports only one pair,
     // driven by one server thread. It is not a general concurrent-context API.
     static std::mutex mutex;
@@ -733,6 +734,7 @@ bool llama_context::experimental_prefill_transition(
     static bool failed = false;
     static uint32_t original_tgt = 0, original_dft = 0;
     static uint64_t released_generation = 0;
+    static llama_experimental_prefill_mode active_mode = LLAMA_EXPERIMENTAL_PREFILL_TRANSACTION;
     std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
         LLAMA_LOG_ERROR("phase_prefill: concurrent transition rejected; process restart required\n");
@@ -788,6 +790,7 @@ bool llama_context::experimental_prefill_transition(
     }
     if (begin) {
         if (active || (target_ubatch != 512 && target_ubatch != 2048) ||
+                (mode == LLAMA_EXPERIMENTAL_PREFILL_BYPASS_ONLY && target_ubatch != 512) ||
                 tgt->cparams.n_ubatch != 512 || dft->cparams.n_ubatch != 512 ||
                 target_ubatch > tgt->cparams.n_ctx ||
                 llama_moe_cache_get_phase() != llama_moe_cache_phase::ready ||
@@ -800,7 +803,14 @@ bool llama_context::experimental_prefill_transition(
         original_tgt = tgt->cparams.n_ubatch;
         original_dft = dft->cparams.n_ubatch;
         active = true;
-    } else if (!active || llama_moe_cache_get_phase() != llama_moe_cache_phase::released ||
+        active_mode = mode;
+    } else if (!active) {
+        return fail("end requires the active pair");
+    } else if (active_mode == LLAMA_EXPERIMENTAL_PREFILL_BYPASS_ONLY) {
+        if (llama_moe_cache_get_phase() != llama_moe_cache_phase::bypassed) {
+            return fail("end requires the bypassed cache");
+        }
+    } else if (llama_moe_cache_get_phase() != llama_moe_cache_phase::released ||
             llama_moe_cache_get_generation() != released_generation) {
         return fail("end requires the active pair and unchanged released cache generation");
     }
@@ -824,6 +834,9 @@ bool llama_context::experimental_prefill_transition(
             // settlement before taking invariants or invalidating allocations.
             if (!cuda_stage(GGML_CUDA_PHASE_SYNCHRONIZE)) {
                 return fail("CUDA synchronization after cache quiesce failed");
+            }
+            if (mode == LLAMA_EXPERIMENTAL_PREFILL_BYPASS_ONLY) {
+                if (!llama_moe_cache_bypass_begin()) { return fail("cache bypass_begin failed"); }
             }
         }
 
@@ -879,6 +892,52 @@ bool llama_context::experimental_prefill_transition(
             };
         };
         const std::array<invariant, 2> before = { snapshot(tgt), snapshot(dft) };
+
+        if (active_mode == LLAMA_EXPERIMENTAL_PREFILL_BYPASS_ONLY) {
+            // Retains every allocation: no buffer freed, reallocated or restored, no scheduler
+            // teardown, no CUDA pool release, no ubatch change and no reserve.
+            //
+            // It DOES invalidate reusable graph results and captured CUDA graphs, at both
+            // boundaries. That is required, not optional: cache topology is fixed when a graph is
+            // constructed, but llm_graph_params::allow_reuse() does not compare cache phase, so a
+            // graph built while READY would otherwise stay reusable while BYPASSED and execute the
+            // cache chain against still-resident device tensors - silently defeating the control -
+            // and a graph built while BYPASSED would keep decode off the cache after READY resumes.
+            // llm_graph_result::reset() clears params and inputs, so can_reuse() fails; the object
+            // itself is kept, unlike the transaction path which nulls it and relies on a later
+            // reserve to recreate it.
+            if (!cuda_stage(GGML_CUDA_PHASE_INVALIDATE_GRAPHS)) {
+                return fail("CUDA graph invalidation failed at bypass boundary");
+            }
+            for (auto * ctx : {tgt, dft}) {
+                if (ctx->gf_res_prev) { ctx->gf_res_prev->reset(); }
+            }
+            if (!begin) {
+                if (!llama_moe_cache_bypass_end() || llama_moe_cache_get_phase() != llama_moe_cache_phase::ready ||
+                        llama_moe_cache_get_capacity() != 150 || !llama_moe_cache_is_active()) {
+                    return fail("cache bypass_end failed");
+                }
+            }
+            size_t bypass_index = 0;
+            for (auto * ctx : {tgt, dft}) {
+                const auto after = snapshot(ctx);
+                const auto & old = before[bypass_index++];
+                if (after.pos_min != old.pos_min || after.pos_max != old.pos_max ||
+                        after.output_buffer != old.output_buffer || after.memory != old.memory ||
+                        after.balloc != old.balloc || after.views != old.views || after.sizes != old.sizes ||
+                        after.metadata_hash != old.metadata_hash || after.contents_hash != old.contents_hash ||
+                        after.n_outputs != old.n_outputs || after.n_batch != old.n_batch) {
+                    return fail("sequence state or host output invariant changed during bypass");
+                }
+                LLAMA_LOG_INFO("phase_prefill: %s %s mode=bypass_only ubatch=%u batch=%u seq0=[%d,%d] outputs=%u"
+                        " metadata=%" PRIu64 " host_hash=%" PRIu64 " verify=%d\n",
+                        begin ? "begin" : "end", ctx == tgt ? "target" : "draft",
+                        ctx->cparams.n_ubatch, ctx->cparams.n_batch, after.pos_min, after.pos_max,
+                        after.n_outputs, after.metadata_hash, after.contents_hash, verify_contents);
+            }
+            if (!begin) { active = false; }
+            return true;
+        }
 
         if (!cuda_stage(GGML_CUDA_PHASE_INVALIDATE_GRAPHS)) { return fail("CUDA graph invalidation failed"); }
         for (auto * ctx : {tgt, dft}) {
@@ -4009,12 +4068,35 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
 }
 
-bool llama_experimental_prefill_begin(llama_context * ctx_tgt, llama_context * ctx_dft, uint32_t target_ubatch) {
-    return llama_context::experimental_prefill_transition(ctx_tgt, ctx_dft, target_ubatch, true);
+bool llama_experimental_prefill_begin(llama_context * ctx_tgt, llama_context * ctx_dft, uint32_t target_ubatch,
+        llama_experimental_prefill_mode mode) {
+    return llama_context::experimental_prefill_transition(ctx_tgt, ctx_dft, target_ubatch, true, mode);
 }
 
 bool llama_experimental_prefill_end(llama_context * ctx_tgt, llama_context * ctx_dft) {
-    return llama_context::experimental_prefill_transition(ctx_tgt, ctx_dft, 0, false);
+    // The mode argument is ignored on end; the active mode recorded at begin is authoritative.
+    return llama_context::experimental_prefill_transition(ctx_tgt, ctx_dft, 0, false,
+            LLAMA_EXPERIMENTAL_PREFILL_TRANSACTION);
+}
+
+void llama_experimental_moe_cache_counters(llama_moe_cache_counters * out) {
+    if (!out) {
+        return;
+    }
+    llama_moe_cache_counter_set internal;
+    llama_moe_cache_get_counters(&internal);
+    out->lookup_calls              = internal.lookup_calls;
+    out->lookup_cache_enabled      = internal.lookup_cache_enabled;
+    out->lookup_null_not_ready     = internal.lookup_null_not_ready;
+    out->lookup_null_unmapped      = internal.lookup_null_unmapped;
+    out->obs_calls                 = internal.obs_calls;
+    out->obs_skip_batch_ineligible = internal.obs_skip_batch_ineligible;
+    out->obs_skip_not_ready        = internal.obs_skip_not_ready;
+    out->obs_counted               = internal.obs_counted;
+    out->obs_hits                  = internal.obs_hits;
+    out->obs_misses                = internal.obs_misses;
+    out->admissions                = internal.admissions;
+    out->steps                     = internal.steps;
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

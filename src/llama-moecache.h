@@ -79,11 +79,52 @@ void llama_moe_cache_step();
 // leaves the cache disabled; there is no automatic retry or empty-cache fallback.
 enum class llama_moe_cache_phase {
     unavailable, ready, quiescing, quiescent, released, restoring, failed,
+    // Diagnostic control state. Lookup, observation and admission are disabled exactly as in
+    // RELEASED, but every device allocation, slot mapping and host table is retained and no buffer
+    // is freed, reallocated or restored. Reached only from QUIESCENT via bypass_begin().
+    bypassed,
 };
 
 bool llama_moe_cache_quiesce();
 bool llama_moe_cache_release();
 bool llama_moe_cache_restore();
+
+// Diagnostic control path, for separating cache-hit/miss numerical differences from the effects of
+// the memory transaction. bypass_begin() requires the same joined/quiescent cache that release()
+// requires and performs no allocation change whatsoever; bypass_end() restarts the upload worker and
+// republishes READY. The generation counter is deliberately NOT incremented: no release or restore
+// occurred.
+//
+// GRAPH REUSE HAZARD (why the caller must invalidate reusable graph results at BOTH boundaries):
+// cache topology is chosen when a graph is CONSTRUCTED - llama-graph.cpp calls
+// llama_moe_cache_lookup() only for batches of at most LLAMA_MOE_CACHE_MAX_BATCH tokens - but
+// llm_graph_params::allow_reuse() does not compare cache phase or generation. A graph built while
+// READY therefore remains reusable while BYPASSED, and would execute the cache chain against still
+// resident device tensors, silently defeating the bypass; symmetrically a graph built while
+// BYPASSED would keep decode off the cache after READY resumes. The transaction path is immune
+// only because it discards graph results as a side effect of releasing allocations.
+bool llama_moe_cache_bypass_begin();
+bool llama_moe_cache_bypass_end();
+
+// Diagnostic counters. lookup_* count GRAPH CONSTRUCTION decisions, not executed expert accesses;
+// obs_* come from the global observation callback and do count executions. Cumulative since process
+// start; never reset by a phase transition.
+struct llama_moe_cache_counter_set {
+    uint64_t lookup_calls;
+    uint64_t lookup_cache_enabled;
+    uint64_t lookup_null_not_ready;
+    uint64_t lookup_null_unmapped;
+    uint64_t obs_calls;
+    uint64_t obs_skip_batch_ineligible;
+    uint64_t obs_skip_not_ready;
+    uint64_t obs_counted;
+    uint64_t obs_hits;
+    uint64_t obs_misses;
+    uint64_t admissions;
+    uint64_t steps;
+};
+
+void llama_moe_cache_get_counters(llama_moe_cache_counter_set * out);
 llama_moe_cache_phase llama_moe_cache_get_phase();
 uint64_t llama_moe_cache_get_generation(); // increments only on successful release/restore
 int32_t llama_moe_cache_get_capacity();
