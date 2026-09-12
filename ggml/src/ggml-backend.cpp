@@ -968,11 +968,30 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    // frankenllama: GGML_SCHED_OFFLOAD_ALT=1 spreads host-weight batches over all GPU
+                    // backends by layer index ("blk.N."), so uploads use every PCIe link instead of
+                    // always the first device's.
+                    static const int offload_alt = getenv("GGML_SCHED_OFFLOAD_ALT") ? atoi(getenv("GGML_SCHED_OFFLOAD_ALT")) : 0;
+                    int cands[GGML_SCHED_MAX_BACKENDS];
+                    int n_cands = 0;
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
-                            SET_CAUSE(tensor, "1.off");
-                            return b;
+                            cands[n_cands++] = b;
+                            if (!offload_alt) {
+                                break;
+                            }
                         }
+                    }
+                    if (n_cands > 0) {
+                        int pick = cands[0];
+                        if (offload_alt && n_cands > 1) {
+                            int layer = -1;
+                            if (sscanf(src->name, "blk.%d.", &layer) == 1 && layer >= 0) {
+                                pick = cands[layer % n_cands];
+                            }
+                        }
+                        SET_CAUSE(tensor, "1.off");
+                        return pick;
                     }
                 }
                 SET_CAUSE(tensor, "1.wgt%d", i);
