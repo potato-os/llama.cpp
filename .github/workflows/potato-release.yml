@@ -195,18 +195,21 @@ jobs:
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
 
-      - name: Add CUDA runtime
+      - name: Collect CUDA runtime
         shell: pwsh
         run: |
-          $dst = '.\build\bin\Release'
+          # separate archive (as upstream does): assets of ~500 MB repeatedly failed to save on the release
+          # upload endpoint, and most of that size is cuBLAS
+          $dst = '.\cudart'
+          New-Item -ItemType Directory -Force $dst | Out-Null
           foreach ($src in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib")) {
             if (Test-Path $src) {
               Get-ChildItem $src -Include cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll -File -Recurse -Depth 0 -ErrorAction SilentlyContinue |
                 Copy-Item -Destination $dst -Force
             }
           }
-          Get-ChildItem $dst -Filter *.dll | Select-Object Name, Length | Format-Table
-          if (-not (Test-Path "$dst\ggml-cuda.dll")) { throw "ggml-cuda.dll missing" }
+          Get-ChildItem $dst | Select-Object Name, Length | Format-Table
+          if (-not (Test-Path ".\build\bin\Release\ggml-cuda.dll")) { throw "ggml-cuda.dll missing" }
           if (-not (Get-ChildItem $dst -Filter cublas64_*.dll)) { throw "cuBLAS runtime missing" }
 
       - name: Smoke test
@@ -253,6 +256,8 @@ jobs:
           git rev-parse HEAD | Out-File -Encoding ascii .\build\bin\Release\POTATO-COMMIT.txt
           7z a -snl "$name.zip" .\build\bin\Release\*
           (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+          7z a "cudart-$name.zip" .\cudart\*
+          (Get-FileHash "cudart-$name.zip" -Algorithm SHA256).Hash.ToLower() + "  cudart-$name.zip" | Out-File -Encoding ascii "cudart-$name.zip.sha256"
 
       - name: Upload
         uses: actions/upload-artifact@v6
@@ -261,6 +266,8 @@ jobs:
           path: |
             llama-potato-bin-win-cuda-*.zip
             llama-potato-bin-win-cuda-*.sha256
+            cudart-llama-potato-bin-win-cuda-*.zip
+            cudart-llama-potato-bin-win-cuda-*.sha256
 
   release:
     name: publish
@@ -287,9 +294,11 @@ jobs:
           rm dist/*.sha256
           notes="Build of \`${GITHUB_SHA}\` for Potato-CODER models.
 
-          - \`linux-cuda-12.8\`: NVIDIA driver 570 or newer, Turing to Blackwell. No CUDA 12 runtime installed? Unpack the matching \`cudart-\` archive into the same folder.
-          - \`win-cuda-12.4\`: NVIDIA driver 551 or newer, Turing to Ada (RTX 20xx to 40xx). CUDA runtime DLLs included.
-          - \`win-cuda-13.4\`: NVIDIA driver 580 or newer, adds Blackwell (RTX 50xx). CUDA runtime DLLs included.
+          - \`linux-cuda-12.8\`: NVIDIA driver 570 or newer, Turing to Blackwell. 
+          - \`win-cuda-12.4\`: NVIDIA driver 551 or newer, Turing to Ada (RTX 20xx to 40xx).
+          - \`win-cuda-13.4\`: NVIDIA driver 580 or newer, adds Blackwell (RTX 50xx).
+
+          CUDA runtime: Windows needs the matching \`cudart-\` archive unpacked into the same folder (Linux only if no CUDA runtime is installed). If a \`cudart-\` archive is missing here, the same-version one from https://github.com/ggml-org/llama.cpp/releases is identical.
 
           See POTATO.md in the repository for the serving flags."
           # draft first, then one file at a time with retries: parallel uploads of several 500 MB assets
@@ -297,13 +306,21 @@ jobs:
           if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --draft --title "$TAG" --notes "$notes"
           fi
-          for f in dist/SHA256SUMS.txt dist/llama-potato-bin-* dist/cudart-*; do
-            ok=0
-            for try in 1 2 3 4 5 6; do
-              echo "upload $f (try $try)"
-              if gh release upload "$TAG" "$f" --clobber -R "$GITHUB_REPOSITORY"; then ok=1; break; fi
+          upload() {
+            for try in 1 2 3 4; do
+              echo "upload $1 (try $try)"
+              if timeout 900 gh release upload "$TAG" "$1" --clobber -R "$GITHUB_REPOSITORY"; then return 0; fi
               sleep 30
             done
-            if [ "$ok" != 1 ]; then echo "upload failed: $f"; exit 1; fi
+            return 1
+          }
+          for f in dist/SHA256SUMS.txt dist/llama-potato-bin-*; do
+            upload "$f" || { echo "upload failed: $f"; exit 1; }
           done
           gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest
+          # the large CUDA runtime archives must not block the release; upstream's cudart archives are identical
+          missing=""
+          for f in dist/cudart-*; do
+            upload "$f" || missing="$missing $(basename "$f")"
+          done
+          if [ -n "$missing" ]; then echo "::warning::CUDA runtime archives not uploaded:$missing"; fi
