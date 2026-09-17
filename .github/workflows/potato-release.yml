@@ -1,0 +1,291 @@
+name: Potato release
+
+# Builds the potato-main branch for Linux and Windows (x64, CUDA) and publishes the zips as a GitHub release.
+#  - manual:  Actions -> "Potato release" -> Run workflow (optionally with a tag to publish)
+#  - tag:     git tag potato-v1.0.0 && git push origin potato-v1.0.0
+# Every binary is smoke-tested on the runner (CPU only, no GPU there): version, the Potato flags in --help,
+# a short generation with a tiny model, and a llama-server health + completion round trip.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. potato-v1.0.0). Empty = build + test only, artifacts stay on the run.'
+        required: false
+        type: string
+  push:
+    tags:
+      - 'potato-v*'
+
+concurrency:
+  group: potato-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # flash-attention KV type pairs compiled in: the 24GB Potato serves K q8_0 / V q5_0
+  FA_QUANTS: 'q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;q8_0-q5_0'
+  TEST_MODEL_URL: 'https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf'
+
+jobs:
+  linux-cuda:
+    name: linux-cuda (${{ matrix.label }})
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu24.04
+    timeout-minutes: 340
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 12.8: driver >= 570, Turing .. Blackwell
+          - cuda: '12.8.2'
+            label: '12.8'
+            archs: '75-real;80-real;86-real;89-real;120-real'
+            defines: '-DGGML_CUDA_CUB_3DOT2=ON'
+
+    steps:
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Dependencies
+        run: |
+          apt-get install -y --no-install-recommends build-essential cmake ninja-build libssl-dev curl jq zip
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: potato-linux-cuda-${{ matrix.label }}
+          evict-old-files: 7d
+          max-size: "2G"
+
+      - name: Build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.archs }}" \
+            -DGGML_CUDA_FA_QUANTS="${{ env.FA_QUANTS }}" \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            ${{ matrix.defines }}
+          cmake --build build -j $(nproc)
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd build/bin
+          ./llama-server --version
+          ./llama-server --help > help.txt 2>&1 || true
+          grep -q -- '--mmproj-swap-draft' help.txt
+          grep -q 'draft-mtp' help.txt
+          rm help.txt
+          ls libggml-cuda.so* > /dev/null
+          curl -fsSL -o /tmp/tiny.gguf "$TEST_MODEL_URL"
+          ./llama-completion -m /tmp/tiny.gguf -p "One day, Lily" -n 32 -c 256 -no-cnv --seed 1 | tee /tmp/gen.txt
+          test "$(wc -c < /tmp/gen.txt)" -gt 40
+          ./llama-server -m /tmp/tiny.gguf -c 256 --port 8099 --no-webui --jinja \
+            --chat-template-kwargs '{"preserve_thinking": false, "reasoning_effort": "medium"}' > /tmp/server.log 2>&1 &
+          SRV=$!
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -fs http://127.0.0.1:8099/health > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          test "$ok" = 1 || { cat /tmp/server.log; exit 1; }
+          curl -fs http://127.0.0.1:8099/completion -d '{"prompt":"One day","n_predict":16}' | jq -e '.content | length > 0'
+          kill $SRV
+
+      - name: Pack
+        shell: bash
+        run: |
+          name=llama-potato-bin-linux-cuda-${{ matrix.label }}-x64
+          cp LICENSE build/bin/LICENSE-llama.cpp
+          git rev-parse HEAD > build/bin/POTATO-COMMIT.txt
+          tar -czf $name.tar.gz --transform "s,^\.,$name," -C build/bin .
+          sha256sum $name.tar.gz > $name.tar.gz.sha256
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-potato-bin-linux-cuda-${{ matrix.label }}-x64
+          path: |
+            llama-potato-bin-linux-cuda-*.tar.gz
+            llama-potato-bin-linux-cuda-*.sha256
+
+  windows-cuda:
+    name: windows-cuda (${{ matrix.cuda }})
+    runs-on: windows-2022
+    timeout-minutes: 340
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 12.4: widest driver support (>= 551), Turing .. Ada
+          - cuda: '12.4'
+            archs: '75-real;80-real;86-real;89-real'
+            defines: '-DGGML_CUDA_CUB_3DOT2=ON'
+          # 13.4: driver >= 580, adds Blackwell (RTX 50xx / RTX PRO 6000)
+          - cuda: '13.4'
+            archs: '75-real;80-real;86-real;89-real;120-real'
+            defines: ''
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: potato-windows-cuda-${{ matrix.cuda }}
+          evict-old-files: 7d
+          max-size: "2G"
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.archs }}" ^
+            -DGGML_CUDA_FA_QUANTS="${{ env.FA_QUANTS }}" ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON ${{ matrix.defines }}
+          if errorlevel 1 exit /b 1
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+
+      - name: Add CUDA runtime
+        shell: pwsh
+        run: |
+          $dst = '.\build\bin\Release'
+          foreach ($src in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib")) {
+            if (Test-Path $src) {
+              Get-ChildItem $src -Include cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll -File -Recurse -Depth 0 -ErrorAction SilentlyContinue |
+                Copy-Item -Destination $dst -Force
+            }
+          }
+          Get-ChildItem $dst -Filter *.dll | Select-Object Name, Length | Format-Table
+          if (-not (Test-Path "$dst\ggml-cuda.dll")) { throw "ggml-cuda.dll missing" }
+          if (-not (Get-ChildItem $dst -Filter cublas64_*.dll)) { throw "cuBLAS runtime missing" }
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location .\build\bin\Release
+          .\llama-server.exe --version
+          $help = (& .\llama-server.exe --help 2>&1 | Out-String)
+          if ($help -notmatch '--mmproj-swap-draft') { throw "--mmproj-swap-draft missing from --help" }
+          if ($help -notmatch 'draft-mtp')           { throw "draft-mtp missing from --help" }
+          Invoke-WebRequest -Uri $env:TEST_MODEL_URL -OutFile $env:RUNNER_TEMP\tiny.gguf
+          $gen = (& .\llama-completion.exe -m $env:RUNNER_TEMP\tiny.gguf -p "One day, Lily" -n 32 -c 256 -no-cnv --seed 1 2>$null | Out-String)
+          Write-Host $gen
+          if ($gen.Length -lt 40) { throw "generation too short" }
+          # same cmd.exe quoting of the JSON argument as the serve-potato.bat on the model card
+          $bat = @'
+          llama-server.exe -m "%RUNNER_TEMP%\tiny.gguf" -c 256 --port 8099 --no-webui --jinja ^
+            --chat-template-kwargs "{\"preserve_thinking\": false, \"reasoning_effort\": \"medium\"}"
+          '@
+          ($bat -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`r`n" | Out-File -Encoding ascii serve-test.bat
+          $srv = Start-Process -FilePath cmd.exe -ArgumentList '/c', 'serve-test.bat' `
+                   -PassThru -RedirectStandardOutput $env:RUNNER_TEMP\srv.out -RedirectStandardError $env:RUNNER_TEMP\srv.err
+          try {
+            $ok = $false
+            foreach ($i in 1..60) {
+              try { Invoke-RestMethod http://127.0.0.1:8099/health | Out-Null; $ok = $true; break } catch { Start-Sleep 1 }
+            }
+            if (-not $ok) { Get-Content $env:RUNNER_TEMP\srv.err; throw "server did not become healthy" }
+            $r = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8099/completion -ContentType 'application/json' -Body '{"prompt":"One day","n_predict":16}'
+            if (-not $r.content) { throw "empty completion" }
+            Write-Host "completion: $($r.content)"
+          } finally {
+            Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+            Remove-Item serve-test.bat -ErrorAction SilentlyContinue
+          }
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          $name = "llama-potato-bin-win-cuda-${{ matrix.cuda }}-x64"
+          Copy-Item LICENSE .\build\bin\Release\LICENSE-llama.cpp
+          git rev-parse HEAD | Out-File -Encoding ascii .\build\bin\Release\POTATO-COMMIT.txt
+          7z a -snl "$name.zip" .\build\bin\Release\*
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-potato-bin-win-cuda-${{ matrix.cuda }}-x64
+          path: |
+            llama-potato-bin-win-cuda-*.zip
+            llama-potato-bin-win-cuda-*.sha256
+
+  release:
+    name: publish
+    needs: [linux-cuda, windows-cuda]
+    if: ${{ github.event_name == 'push' || inputs.tag != '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: |
+          ls -l dist
+          cat dist/*.sha256 > dist/SHA256SUMS.txt
+          rm dist/*.sha256
+          notes="Build of \`${GITHUB_SHA}\` for Potato-CODER models.
+
+          - \`linux-cuda-12.8\`: NVIDIA driver 570 or newer, Turing to Blackwell.
+          - \`win-cuda-12.4\`: NVIDIA driver 551 or newer, Turing to Ada (RTX 20xx to 40xx). CUDA runtime DLLs included.
+          - \`win-cuda-13.4\`: NVIDIA driver 580 or newer, adds Blackwell (RTX 50xx). CUDA runtime DLLs included.
+
+          See POTATO.md in the repository for the serving flags."
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --notes "$notes"
+          fi
