@@ -120,6 +120,12 @@ jobs:
           git rev-parse HEAD > build/bin/POTATO-COMMIT.txt
           tar -czf $name.tar.gz --transform "s,^\.,$name," -C build/bin .
           sha256sum $name.tar.gz > $name.tar.gz.sha256
+          # optional CUDA runtime for machines without a CUDA 12 install: unpack into the same folder (RPATH is $ORIGIN)
+          mkdir cudart
+          cp -P /usr/local/cuda/lib64/libcudart.so.* /usr/local/cuda/lib64/libcublas.so.* /usr/local/cuda/lib64/libcublasLt.so.* cudart/
+          ls -l cudart
+          tar -czf cudart-$name.tar.gz --transform "s,^\.,$name," -C cudart .
+          sha256sum cudart-$name.tar.gz > cudart-$name.tar.gz.sha256
 
       - name: Upload
         uses: actions/upload-artifact@v6
@@ -128,6 +134,8 @@ jobs:
           path: |
             llama-potato-bin-linux-cuda-*.tar.gz
             llama-potato-bin-linux-cuda-*.sha256
+            cudart-llama-potato-bin-linux-cuda-*.tar.gz
+            cudart-llama-potato-bin-linux-cuda-*.sha256
 
   windows-cuda:
     name: windows-cuda (${{ matrix.cuda }})
@@ -279,7 +287,7 @@ jobs:
           rm dist/*.sha256
           notes="Build of \`${GITHUB_SHA}\` for Potato-CODER models.
 
-          - \`linux-cuda-12.8\`: NVIDIA driver 570 or newer, Turing to Blackwell.
+          - \`linux-cuda-12.8\`: NVIDIA driver 570 or newer, Turing to Blackwell. No CUDA 12 runtime installed? Unpack the matching \`cudart-\` archive into the same folder.
           - \`win-cuda-12.4\`: NVIDIA driver 551 or newer, Turing to Ada (RTX 20xx to 40xx). CUDA runtime DLLs included.
           - \`win-cuda-13.4\`: NVIDIA driver 580 or newer, adds Blackwell (RTX 50xx). CUDA runtime DLLs included.
 

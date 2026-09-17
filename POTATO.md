@@ -17,6 +17,7 @@ Prebuilt zips are on the [releases page](../../releases):
 | file | for |
 |---|---|
 | `llama-potato-bin-linux-cuda-12.8-x64.tar.gz` | Linux x64, NVIDIA driver 570+, RTX 20xx to 50xx |
+| `cudart-llama-potato-bin-linux-cuda-12.8-x64.tar.gz` | optional: CUDA 12 runtime libraries for Linux machines without a CUDA install; unpack into the same folder |
 | `llama-potato-bin-win-cuda-12.4-x64.zip` | Windows x64, NVIDIA driver 551+, RTX 20xx to 40xx |
 | `llama-potato-bin-win-cuda-13.4-x64.zip` | Windows x64, NVIDIA driver 580+, adds RTX 50xx |
 
