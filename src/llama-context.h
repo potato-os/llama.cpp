@@ -57,6 +57,11 @@ struct llama_context {
 
     void synchronize();
 
+    // [EXPERIMENTAL] release/restore the device memory of the memory module and the compute buffers (see llama-ext.h)
+    bool gpu_suspend();
+    bool gpu_resume();
+    bool gpu_is_suspended() const { return gpu_suspended; }
+
     static bool experimental_prefill_transition(
             llama_context * ctx_tgt, llama_context * ctx_dft, uint32_t target_ubatch, bool begin,
             llama_experimental_prefill_mode mode);
@@ -348,6 +353,8 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    bool gpu_suspended = false; // between gpu_suspend() and a successful gpu_resume()
     bool experimental_prefill_failed = false;
 
     ggml_backend_t backend_cpu = nullptr;

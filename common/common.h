@@ -600,6 +600,7 @@ struct common_params {
     int image_min_tokens = -1;
     int image_max_tokens = -1;
     int mtmd_batch_max_tokens = 1024;
+    bool mmproj_swap_draft = false;             // server: release the draft ctx VRAM while media is encoded on a temporary GPU projector
 
     // for video input
     float       video_fps                   = 4.0f;

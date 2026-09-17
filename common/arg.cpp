@@ -2622,6 +2622,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        {"--mmproj-swap-draft"},
+        {"--no-mmproj-swap-draft"},
+        string_format("with --no-mmproj-offload and --spec-type draft-mtp: encode media on a temporary GPU projector while the "
+                      "MTP draft context releases its VRAM; falls back to the CPU projector when VRAM is short (default: %s)",
+                      params.mmproj_swap_draft ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.mmproj_swap_draft = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MMPROJ_SWAP_DRAFT"));
+    add_opt(common_arg(
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: auto)\n"

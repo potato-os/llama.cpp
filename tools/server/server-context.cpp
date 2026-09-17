@@ -17,6 +17,10 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "../../src/llama-ext.h" // staging API: llama_context_suspend_gpu / llama_context_resume_gpu (--mmproj-swap-draft)
+#include <chrono>
+#include <thread>
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -739,12 +743,143 @@ struct server_slot {
     }
 };
 
+// --mmproj-swap-draft: encode media on a temporary GPU projector while the draft context's VRAM is released
+// only used on the main loop thread (process_mtmd_chunk runs inside yield_to_queue on the calling thread)
+struct server_mmproj_swap {
+    std::string         path;
+    mtmd_context_params mparams_gpu = mtmd_context_params_default();
+    const llama_model * model_tgt = nullptr;
+    llama_context     * ctx_tgt   = nullptr;
+    llama_context     * ctx_dft   = nullptr;
+    ggml_backend_dev_t  dev       = nullptr; // device holding the draft KV + compute buffers
+
+    size_t      weights_bytes   = 0;                  // mmproj file size
+    size_t      bytes_per_token = 176*1024;           // env LLAMA_MMPROJ_SWAP_KIB_PER_TOKEN
+    size_t      reserve_bytes   = 128*1024*1024;      // env LLAMA_MMPROJ_SWAP_RESERVE_MIB
+    std::string test_mode;                            // env LLAMA_MMPROJ_SWAP_TEST: "" | "cpu" | "init-fail"
+    uint64_t    n_swaps = 0;
+
+    size_t dev_free() const {
+        size_t f = 0;
+        size_t t = 0;
+        ggml_backend_dev_memory(dev, &f, &t);
+        return f;
+    }
+
+    // KV + compute buffers of ctx_dft on dev
+    size_t draft_reclaimable() const {
+        size_t n = 0;
+        for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_dft)) {
+            if (!ggml_backend_buft_is_host(buft) && ggml_backend_buft_get_device(buft) == dev) {
+                n += mb.context + mb.compute;
+            }
+        }
+        return n;
+    }
+
+    void resume_or_abort(int64_t & t_us) {
+        const int64_t t0 = ggml_time_us();
+        for (int attempt = 1; !llama_context_resume_gpu(ctx_dft); ++attempt) {
+            if (attempt >= 20) {
+                GGML_ABORT("--mmproj-swap-draft: failed to resume the draft context after %d attempts (VRAM taken by another process?)", attempt);
+            }
+            SRV_WRN("--mmproj-swap-draft: failed to resume the draft context (attempt %d), retrying in 250 ms\n", attempt);
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        t_us = ggml_time_us() - t0;
+    }
+
+    int32_t encode(const server_slot & slot, mtmd_batch * mbatch, size_t n_tokens) {
+        const double MiB = 1024.0*1024.0;
+
+        n_swaps++;
+
+        llama_synchronize(ctx_tgt); // pending image/text decode, keeps the step timings honest
+        llama_synchronize(ctx_dft); // the MTP process() leaves llama_decode(ctx_dft) async
+
+        const int64_t t_start = ggml_time_us();
+
+        int64_t t_susp = 0;
+        int64_t t_init = 0;
+        int64_t t_enc  = 0;
+        int64_t t_free = 0;
+        int64_t t_res  = 0;
+        int64_t t_cpu  = 0;
+
+        const size_t need     = weights_bytes + n_tokens*bytes_per_token + reserve_bytes;
+        const size_t free_pre = dev_free();
+        size_t free_susp = 0;
+
+        const char * via = "gpu";
+        int32_t res = -1;
+
+        if (free_pre + draft_reclaimable() < need) {
+            via = "cpu (not enough VRAM even with the draft released)";
+        } else {
+            int64_t t0 = ggml_time_us();
+            if (!llama_context_suspend_gpu(ctx_dft)) {
+                via = "cpu (draft suspend failed)";
+            } else {
+                t_susp = ggml_time_us() - t0;
+
+                // resumes the draft when this scope is left, also on exceptions
+                struct resume_guard {
+                    server_mmproj_swap & self;
+                    int64_t & t;
+                    ~resume_guard() { self.resume_or_abort(t); }
+                } guard { *this, t_res };
+
+                free_susp = dev_free();
+
+                if (test_mode == "cpu") {
+                    via = "cpu (LLAMA_MMPROJ_SWAP_TEST=cpu)";
+                } else if (free_susp < need) {
+                    via = "cpu (not enough VRAM after suspend)";
+                } else {
+                    t0 = ggml_time_us();
+                    mtmd::context_ptr gctx(mtmd_init_from_file(test_mode == "init-fail" ? "" : path.c_str(), model_tgt, mparams_gpu));
+                    t_init = ggml_time_us() - t0;
+
+                    if (!gctx) {
+                        via = "cpu (GPU projector init failed)";
+                    } else {
+                        t0 = ggml_time_us();
+                        res = mtmd_batch_encode_with_ctx(mbatch, gctx.get());
+                        t_enc = ggml_time_us() - t0;
+
+                        t0 = ggml_time_us();
+                        gctx.reset(); // releases the weights, compute buffers, VMM pool and cuBLAS handles before the resume
+                        t_free = ggml_time_us() - t0;
+
+                        if (res != 0) {
+                            via = "cpu (GPU encode failed)";
+                        }
+                    }
+                } // gctx (if any) is destroyed here, before the guard
+            } // guard: the draft is resumed here
+        }
+
+        if (res != 0) {
+            const int64_t t0 = ggml_time_us();
+            res = mtmd_batch_encode(mbatch); // CPU context, output_embd is overwritten
+            t_cpu = ggml_time_us() - t0;
+        }
+
+        SLT_INF(slot, "mmproj swap #%" PRIu64 ": %zu tokens via %s | suspend %.1f ms, gpu init %.1f ms, encode %.1f ms, free %.1f ms, resume %.1f ms, cpu encode %.1f ms, total %.1f ms | VRAM free %.0f -> %.0f MiB, need %.0f MiB\n",
+                n_swaps, n_tokens, via, t_susp/1e3, t_init/1e3, t_enc/1e3, t_free/1e3, t_res/1e3, t_cpu/1e3,
+                (ggml_time_us() - t_start)/1e3, free_pre/MiB, free_susp/MiB, need/MiB);
+
+        return res;
+    }
+};
+
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
 //       slot is passed as const to avoid accidental modification of the slot state
 //       some pointers are allowed to be used, they are not used by to_json()
-static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
+// mmproj_swap: non-null with --mmproj-swap-draft, the media batch is then encoded through it
+static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out, server_mmproj_swap * mmproj_swap) {
     GGML_ASSERT(slot.mctx);
     const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
@@ -803,6 +938,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     mbatch.reset(mtmd_batch_init(mctx));
     res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
     GGML_ASSERT(res == 0); // we should never have an empty batch
+    size_t n_tokens_batch = mtmd_input_chunk_get_n_tokens(chunk.get());
 
     // try batching as much as possible
     int n_added = 1;
@@ -814,6 +950,9 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
         }
         res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
         n_added += (res == 0 ? 1 : 0);
+        if (res == 0) {
+            n_tokens_batch += mtmd_input_chunk_get_n_tokens(next_chunk->get());
+        }
         idx_cur = next_idx;
         SLT_DBG(slot, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
         // if res != 0, batch is full or chunk is not compatible -> this loop breaks
@@ -822,7 +961,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
-    res = mtmd_batch_encode(mbatch.get());
+    res = mmproj_swap ? mmproj_swap->encode(slot, mbatch.get(), n_tokens_batch) : mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
@@ -899,6 +1038,8 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    std::unique_ptr<server_mmproj_swap> mmproj_swap; // --mmproj-swap-draft, null when disabled
 
     bool add_bos_token = true;
 
@@ -1156,6 +1297,8 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        mmproj_swap.reset();
+
         phase_prefill_end("destroy");
         spec.reset();
         spec_init.reset();
@@ -1577,6 +1720,93 @@ private:
                 llama_n_ubatch(ctx_tgt) != 512 || llama_n_ubatch(ctx_dft) != 512)) {
             SRV_ERR("%s", "phase prefill requires initialized external MTP contexts with batch4096/ubatch512\n");
             return false;
+        }
+
+        mmproj_swap.reset();
+        if (params_base.mmproj_swap_draft) {
+            if (!mctx) {
+                SRV_WRN("%s", "--mmproj-swap-draft: no multimodal projector loaded, option ignored\n");
+            } else if (params_base.mmproj_use_gpu) {
+                SRV_WRN("%s", "--mmproj-swap-draft: projector already on the GPU (use --no-mmproj-offload), option ignored\n");
+            } else if (!ctx_dft || !spec) {
+                SRV_WRN("%s", "--mmproj-swap-draft: no draft context, option ignored\n");
+            } else if (!spec_mtp) {
+                // 2026-09-14 (Potato v0.2): external MTP heads (-md) are allowed too; only the draft KV + compute buffers are
+                // released (the head weights stay), the startup probe reports how much that is
+                SRV_WRN("%s", "--mmproj-swap-draft: requires --spec-type draft-mtp, option ignored\n");
+            } else {
+                auto sw = std::make_unique<server_mmproj_swap>();
+                sw->path      = mmproj_path;
+                sw->model_tgt = model_tgt;
+                sw->ctx_tgt   = ctx_tgt;
+                sw->ctx_dft   = ctx_dft;
+
+                // the device with the largest draft KV + compute share
+                size_t best = 0;
+                for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_dft)) {
+                    if (!ggml_backend_buft_is_host(buft) && mb.context + mb.compute > best) {
+                        best    = mb.context + mb.compute;
+                        sw->dev = ggml_backend_buft_get_device(buft);
+                    }
+                }
+
+                sw->mparams_gpu                 = mparams;                       // same values as the CPU projector ...
+                sw->mparams_gpu.use_gpu         = true;                          // ... except:
+                sw->mparams_gpu.device          = sw->dev;                       // mmproj_device is null under --no-mmproj-offload
+                sw->mparams_gpu.warmup          = false;                         // reserve for the real image on the first encode
+                sw->mparams_gpu.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; // no patches^2 attention matrix
+                sw->mparams_gpu.progress_callback           = nullptr;           // user_data points at a load_model local
+                sw->mparams_gpu.progress_callback_user_data = nullptr;
+
+                std::error_code ec;
+                sw->weights_bytes = std::filesystem::file_size(mmproj_path, ec);
+                if (ec) {
+                    sw->weights_bytes = 0;
+                    SRV_WRN("%s", "--mmproj-swap-draft: cannot stat the mmproj file, VRAM estimate excludes weights\n");
+                }
+
+                auto env_size = [](const char * name, size_t def, size_t unit) -> size_t {
+                    const char * e = getenv(name);
+                    if (!e) {
+                        return def;
+                    }
+                    try {
+                        return (size_t) std::stoull(e)*unit;
+                    } catch (const std::exception &) {
+                        SRV_WRN("--mmproj-swap-draft: invalid value '%s' for %s, using the default\n", e, name);
+                        return def;
+                    }
+                };
+                sw->bytes_per_token = env_size("LLAMA_MMPROJ_SWAP_KIB_PER_TOKEN", sw->bytes_per_token, 1024);
+                sw->reserve_bytes   = env_size("LLAMA_MMPROJ_SWAP_RESERVE_MIB",   sw->reserve_bytes,   1024*1024);
+                if (const char * e = getenv("LLAMA_MMPROJ_SWAP_TEST")) {
+                    sw->test_mode = e;
+                }
+
+                if (!sw->dev) {
+                    SRV_WRN("%s", "--mmproj-swap-draft: draft context has no device memory, option ignored\n");
+                } else {
+                    // startup probe: detects unsupported memory types and measures what the draft gives back
+                    const size_t f0 = sw->dev_free();
+                    int64_t t0 = ggml_time_us();
+                    if (!llama_context_suspend_gpu(ctx_dft)) {
+                        SRV_WRN("%s", "--mmproj-swap-draft: the draft context cannot be suspended, option ignored\n");
+                    } else {
+                        const int64_t t_s = ggml_time_us() - t0;
+                        const size_t  f1  = sw->dev_free();
+                        t0 = ggml_time_us();
+                        if (!llama_context_resume_gpu(ctx_dft)) {
+                            SRV_ERR("%s", "--mmproj-swap-draft: failed to resume the draft context in the startup probe\n");
+                            return false;
+                        }
+                        SRV_INF("--mmproj-swap-draft: enabled on %s, draft releases %.0f MiB (probe suspend %.1f ms, resume %.1f ms), projector %.0f MiB, estimate %zu KiB/token + %.0f MiB reserve%s%s\n",
+                                ggml_backend_dev_name(sw->dev), (f1 > f0 ? f1 - f0 : 0)/1048576.0, t_s/1e3, (ggml_time_us() - t0)/1e3,
+                                sw->weights_bytes/1048576.0, sw->bytes_per_token/1024, sw->reserve_bytes/1048576.0,
+                                sw->test_mode.empty() ? "" : ", test mode ", sw->test_mode.c_str());
+                        mmproj_swap = std::move(sw);
+                    }
+                }
+            }
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -3778,7 +4008,7 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out, mmproj_swap.get());
                         });
 
                         if (res != 0) {

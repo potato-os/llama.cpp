@@ -315,7 +315,7 @@ MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
 
 // batch encoding API
 // chunks are not owned by the batch, they will not be freed by mtmd_batch_free()
-// batch is valid for a given context, cannot be shared across contexts
+// batch is bound to the context given to mtmd_batch_init(); mtmd_batch_encode_with_ctx() can run the encoder of another context
 MTMD_API mtmd_batch * mtmd_batch_init(mtmd_context * ctx);
 MTMD_API void         mtmd_batch_free(mtmd_batch * batch);
 
@@ -329,6 +329,12 @@ MTMD_API int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk
 // returns 0 on success
 // returns 1 on generic error
 MTMD_API int32_t mtmd_batch_encode(mtmd_batch * batch);
+
+// encode the chunks of a batch with the encoder of enc_ctx, loaded from the same mmproj with compatible params
+// (e.g. a temporary GPU context next to a long-lived CPU context). The output stays in the batch
+// (mtmd_batch_get_output_embd), so enc_ctx can be freed right after. enc_ctx == NULL -> same as mtmd_batch_encode
+// returns 0 on success, 1 on generic error (batch output cleared), 2 if enc_ctx is not compatible with the batch ctx
+MTMD_API int32_t mtmd_batch_encode_with_ctx(mtmd_batch * batch, mtmd_context * enc_ctx);
 MTMD_API float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * chunk);
 
 

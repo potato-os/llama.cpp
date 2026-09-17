@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -151,6 +152,12 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // [EXPERIMENTAL] device memory suspend/resume
+
+    bool gpu_suspend() override;
+    bool gpu_resume() override;
+    bool gpu_suspended() const override { return suspended; }
+
     //
     // llama_kv_cache specific API
     //
@@ -290,6 +297,17 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // [gpu suspend] state, see gpu_suspend()
+    struct susp_buf {
+        ggml_backend_buffer_type_t buft = nullptr; // nullptr: buffer kept (host memory)
+        size_t                     size = 0;
+    };
+    bool                       suspended  = false;
+    std::vector<susp_buf>      susp_bufs; // one entry per ctxs_bufs entry
+    std::vector<uint32_t>      susp_rows; // live rows per stream (v_cells[s].used_max_p1())
+    std::unique_ptr<uint8_t[]> susp_host; // host copy of the live rows
+    size_t                     susp_bytes = 0;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

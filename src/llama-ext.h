@@ -116,6 +116,18 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// [EXPERIMENTAL] temporarily release the device memory of a context; the context pointer, sampler chains and all
+// memory metadata stay valid.
+// suspend: synchronize, copy the used KV cells to host memory, free the KV device buffers and the compute buffers.
+//          returns false (nothing changed) if unsupported: no memory, memory other than a plain llama_kv_cache
+//          (recurrent/hybrid/iswa/...), shared KV cells, no_alloc, split-mode tensor, training, no KV on a device.
+// resume:  re-allocate the buffers, restore the KV data, re-reserve the compute buffers.
+//          returns false if an allocation failed; the context stays suspended and resume can be retried.
+// while suspended llama_decode/llama_encode return -4 and the state save/load functions return 0.
+LLAMA_API bool llama_context_suspend_gpu     (struct llama_context * ctx);
+LLAMA_API bool llama_context_resume_gpu      (struct llama_context * ctx);
+LLAMA_API bool llama_context_is_gpu_suspended(const struct llama_context * ctx);
+
 //
 // model/context data extraction
 //
