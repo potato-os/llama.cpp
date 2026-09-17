@@ -1159,6 +1159,34 @@ static common_chat_params common_chat_params_init_ministral_3(const common_chat_
     return data;
 }
 
+// Which non-string JSON types a (ref-resolved) parameter schema admits, through type / type[] / anyOf / oneOf / allOf,
+// plus the structural hints "properties" (object) and "items" (array). Used by the qwen3-coder XML tool-call parser.
+static void qwen3_coder_collect_non_string_types(const json & s, bool & obj, bool & arr, bool & num, bool & boolean, bool & null, int depth = 0) {
+    if (!s.is_object() || depth > 16) {
+        return;
+    }
+    auto mark = [&](const json & t) {
+        if (!t.is_string()) return;
+        const std::string ts = t;
+        if (ts == "object") obj = true;
+        else if (ts == "array") arr = true;
+        else if (ts == "number" || ts == "integer") num = true;
+        else if (ts == "boolean") boolean = true;
+        else if (ts == "null") null = true;
+    };
+    if (s.contains("type")) {
+        const json & t = s["type"];
+        if (t.is_array()) { for (const auto & x : t) mark(x); } else { mark(t); }
+    }
+    if (s.contains("properties") && !s.contains("type")) obj = true;
+    if (s.contains("items") && !s.contains("type")) arr = true;
+    for (const char * key : { "anyOf", "oneOf", "allOf" }) {
+        if (s.contains(key) && s[key].is_array()) {
+            for (const auto & alt : s[key]) qwen3_coder_collect_non_string_types(alt, obj, arr, num, boolean, null, depth + 1);
+        }
+    }
+}
+
 static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_template &          tmpl,
                                                               const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -1267,9 +1295,28 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
                     auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param_name)) + ">\n");
 
-                    auto arg_value = schema_info.resolves_to_string(param_schema) ?
-                        arg_string :
-                        p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
+                    // Port of upstream #28742 (chat: improve parsing of complex types in qwen3-coder), 2026-09-14:
+                    // a parameter that may be a string AND an object/array/number/bool/null used to be parsed as a raw
+                    // string; now the JSON alternatives are tried first so the value keeps its type.
+                    bool t_obj = false, t_arr = false, t_num = false, t_bool = false, t_null = false;
+                    qwen3_coder_collect_non_string_types(param_schema, t_obj, t_arr, t_num, t_bool, t_null);
+                    const bool may_string = schema_info.resolves_to_string(param_schema);
+                    common_peg_parser arg_value = p.eps();
+                    if (!may_string) {
+                        arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
+                    } else if (!(t_obj || t_arr || t_num || t_bool || t_null)) {
+                        arg_value = arg_string;
+                    } else {
+                        // The string alternative accepts any text, so the grammar only keeps the raw string
+                        // rule. The parser still tries the JSON alternatives first to type the value.
+                        auto json_value = p.choice();
+                        if (t_obj)  { json_value |= p.json_object(); }
+                        if (t_arr)  { json_value |= p.json_array(); }
+                        if (t_num)  { json_value |= p.json_number(); }
+                        if (t_bool) { json_value |= p.json_bool(); }
+                        if (t_null) { json_value |= p.json_null(); }
+                        arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_close) | arg_string, "xml-arg-string");
+                    }
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
 
