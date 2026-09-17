@@ -124,6 +124,16 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // [EXPERIMENTAL] device memory suspend/resume, see llama_context_suspend_gpu()
+    //
+
+    // copy the live device data to host memory and free the device buffers; false (nothing changed) if unsupported
+    virtual bool gpu_suspend() { return false; }
+    // re-allocate the device buffers and restore the data; false if an allocation failed (still suspended, retryable)
+    virtual bool gpu_resume() { return true; }
+    virtual bool gpu_suspended() const { return false; }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

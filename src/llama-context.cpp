@@ -804,6 +804,71 @@ void llama_context::synchronize() {
     t_compute_start_us = 0;
 }
 
+bool llama_context::gpu_suspend() {
+    if (gpu_suspended) {
+        return true;
+    }
+
+    if (!memory || model.hparams.no_alloc || opt_ctx || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        return false;
+    }
+
+    // pending async decode (the MTP process() does not synchronize) and async output copies
+    synchronize();
+
+    if (!memory->gpu_suspend()) {
+        return false;
+    }
+
+    gpu_suspended = true;
+
+    // graph reuse would run the previous graph with the freed KV data pointers
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+    if (gf_res_reserve) {
+        gf_res_reserve->reset();
+    }
+
+    // empty scheduler: frees the compute buffers, keeps get_sched() non-null
+    const size_t max_nodes = graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // every scheduler of this context carries the selective expert copy callback (as sched_reserve() sets it)
+    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    sched_need_reserve = true;
+
+    return true;
+}
+
+bool llama_context::gpu_resume() {
+    if (!gpu_suspended) {
+        return true;
+    }
+
+    // memory first: tensors without data/buffer would otherwise be placed into the compute buffer
+    if (!memory->gpu_resume()) {
+        LLAMA_LOG_WARN("%s: failed to re-allocate the memory buffers\n", __func__);
+        return false;
+    }
+
+    sched_need_reserve = true;
+
+    try {
+        sched_reserve();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_WARN("%s: failed to reserve compute buffers: %s\n", __func__, err.what());
+        sched_need_reserve = true; // stays suspended, retryable (memory->gpu_resume() is idempotent)
+        return false;
+    }
+
+    gpu_suspended = false;
+
+    return true;
+}
+
 const llama_model & llama_context::get_model() const {
     return model;
 }
@@ -849,7 +914,7 @@ llama_memory_t llama_context::get_memory() const {
 }
 
 bool llama_context::memory_update(bool optimize) {
-    if (!memory) {
+    if (!memory || gpu_suspended) {
         return false;
     }
 
@@ -1480,6 +1545,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if (gpu_suspended) {
+        LLAMA_LOG_ERROR("%s: device memory of this context is suspended\n", __func__);
+        return -4;
+    }
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1719,6 +1789,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (gpu_suspended) {
+        LLAMA_LOG_ERROR("%s: device memory of this context is suspended\n", __func__);
+        return -4;
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -4191,6 +4266,10 @@ struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_tokens,
         uint32_t n_seqs,
         uint32_t n_outputs) {
+    if (ctx->gpu_is_suspended()) {
+        return nullptr;
+    }
+
     auto memory = ctx->get_memory();
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -4564,4 +4643,27 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+bool llama_context_suspend_gpu(struct llama_context * ctx) {
+    try {
+        return ctx->gpu_suspend();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to suspend the device memory: %s\n", __func__, err.what());
+        // tell the caller whether it has to resume
+        return ctx->gpu_is_suspended();
+    }
+}
+
+bool llama_context_resume_gpu(struct llama_context * ctx) {
+    try {
+        return ctx->gpu_resume();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to resume the device memory: %s\n", __func__, err.what());
+        return false;
+    }
+}
+
+bool llama_context_is_gpu_suspended(const struct llama_context * ctx) {
+    return ctx->gpu_is_suspended();
 }
