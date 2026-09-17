@@ -292,8 +292,18 @@ jobs:
           - \`win-cuda-13.4\`: NVIDIA driver 580 or newer, adds Blackwell (RTX 50xx). CUDA runtime DLLs included.
 
           See POTATO.md in the repository for the serving flags."
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
-          else
-            gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --notes "$notes"
+          # draft first, then one file at a time with retries: parallel uploads of several 500 MB assets
+          # repeatedly failed with HTTP 400/500 from uploads.github.com; the release goes public only when complete
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --draft --title "$TAG" --notes "$notes"
           fi
+          for f in dist/SHA256SUMS.txt dist/llama-potato-bin-* dist/cudart-*; do
+            ok=0
+            for try in 1 2 3 4 5 6; do
+              echo "upload $f (try $try)"
+              if gh release upload "$TAG" "$f" --clobber -R "$GITHUB_REPOSITORY"; then ok=1; break; fi
+              sleep 30
+            done
+            if [ "$ok" != 1 ]; then echo "upload failed: $f"; exit 1; fi
+          done
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest
