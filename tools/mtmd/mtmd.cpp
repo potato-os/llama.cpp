@@ -2086,7 +2086,7 @@ int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk)
     return 3; // "cannot batch" error code
 }
 
-static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
+static int32_t mtmd_batch_encode_impl(mtmd_batch * batch, mtmd_context * enc_ctx) {
     if (batch->entries.empty()) {
         LOG_ERR("%s: batch is empty\n", __func__);
         return 1;
@@ -2095,6 +2095,27 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
         if (chunk->is_placeholder()) {
             LOG_ERR("%s: chunk is placeholder\n", __func__);
             return 1;
+        }
+    }
+
+    // a foreign encoder context must produce the same embeddings layout as the batch context
+    if (enc_ctx != batch->ctx) {
+        if (enc_ctx->n_embd_out() != batch->ctx->n_embd_out()) {
+            LOG_ERR("%s: encoder context has n_embd_out = %d, batch context has %d\n", __func__,
+                    (int) enc_ctx->n_embd_out(), (int) batch->ctx->n_embd_out());
+            return 2;
+        }
+        for (const auto * chunk : batch->entries) {
+            bool ok = false;
+            if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                ok = enc_ctx->ctx_v && enc_ctx->proj_type_v() == batch->ctx->proj_type_v();
+            } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+                ok = enc_ctx->ctx_a && enc_ctx->proj_type_a() == batch->ctx->proj_type_a();
+            }
+            if (!ok) {
+                LOG_ERR("%s: encoder context is not compatible with chunk type %d\n", __func__, (int) chunk->type);
+                return 2;
+            }
         }
     }
 
@@ -2131,18 +2152,40 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
 
     LOG_DBG("%s: encoding batch with %zu entries and total %zu tokens\n",
             __func__, batch->entries.size(), mtmd_input_chunk_get_n_tokens(batch_chunk.get()));
+    if (enc_ctx != batch->ctx) {
+        // clip_encode aborts on a token count mismatch, check it up front
+        const auto & f32 = batch_chunk->tokens_image ? batch_chunk->tokens_image->batch_f32 : batch_chunk->tokens_audio->batch_f32;
+        if (!f32.entries.empty()) {
+            const int n_batch_ctx = clip_n_output_tokens(batch->ctx->get_clip_ctx(batch_chunk.get()), &f32.entries[0]);
+            const int n_enc_ctx   = clip_n_output_tokens(enc_ctx->get_clip_ctx(batch_chunk.get()),    &f32.entries[0]);
+            if (n_batch_ctx != n_enc_ctx) {
+                LOG_ERR("%s: encoder context outputs %d tokens per entry, batch context %d\n", __func__, n_enc_ctx, n_batch_ctx);
+                return 2;
+            }
+        }
+    }
+
     int32_t res = mtmd_encode_chunk_impl(
-        batch->ctx,
+        enc_ctx,
         batch_chunk.get(),
         batch->output_embd);
+    if (res != 0) {
+        // the output was resized before encoding, do not let get_output_embd return garbage
+        batch->output_embd.clear();
+    }
     return res;
 }
 
 int32_t mtmd_batch_encode(mtmd_batch * batch) {
+    return mtmd_batch_encode_with_ctx(batch, nullptr);
+}
+
+int32_t mtmd_batch_encode_with_ctx(mtmd_batch * batch, mtmd_context * enc_ctx) {
     try {
-        return mtmd_batch_encode_impl(batch);
+        return mtmd_batch_encode_impl(batch, enc_ctx ? enc_ctx : batch->ctx);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
+        batch->output_embd.clear();
         return 1;
     }
 }

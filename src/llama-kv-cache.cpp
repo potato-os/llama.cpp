@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <new>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -372,11 +373,196 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
-    if (data) {
+    if (data && !suspended) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+}
+
+// [EXPERIMENTAL] device memory suspend/resume
+// a tensor is "on the device" when its buffer is not a host buffer
+// both functions use the same loop order: stream, layer, {k, v}; only the live rows [0, used_max_p1) of each stream are kept
+
+static bool llama_kv_tensor_on_device(const ggml_tensor * t) {
+    return t && t->buffer && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(t->buffer));
+}
+
+bool llama_kv_cache::gpu_suspend() {
+    if (suspended) {
+        return true;
+    }
+
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other || hparams.no_alloc) {
+        return false;
+    }
+
+    std::vector<susp_buf> bufs(ctxs_bufs.size());
+
+    bool any = false;
+    for (size_t i = 0; i < ctxs_bufs.size(); ++i) {
+        ggml_backend_buffer_t buf = ctxs_bufs[i].second.get();
+        if (!buf) {
+            return false;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        const size_t               size = ggml_backend_buffer_get_size(buf);
+
+        if (ggml_backend_buft_is_host(buft)) {
+            continue; // keep host buffers
+        }
+
+        if (size > ggml_backend_buft_get_max_size(buft)) {
+            // multi-buffer: cannot be re-created atomically
+            return false;
+        }
+
+        bufs[i] = { buft, size };
+        any = true;
+    }
+
+    if (!any) {
+        return false;
+    }
+
+    std::vector<uint32_t> rows(n_stream);
+    size_t n_bytes = 0;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        rows[s] = v_cells[s].used_max_p1();
+
+        for (const auto & layer : layers) {
+            for (const ggml_tensor * t : { layer.k, layer.v }) {
+                if (llama_kv_tensor_on_device(t)) {
+                    n_bytes += (size_t) rows[s]*t->nb[1];
+                }
+            }
+        }
+    }
+
+    std::unique_ptr<uint8_t[]> host;
+    if (n_bytes > 0) {
+        host.reset(new (std::nothrow) uint8_t[n_bytes]);
+        if (!host) {
+            LLAMA_LOG_WARN("%s: failed to allocate %.2f MiB of host memory\n", __func__, n_bytes/1024.0/1024.0);
+            return false;
+        }
+    }
+
+    size_t off = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (rows[s] == 0) {
+            continue;
+        }
+
+        for (const auto & layer : layers) {
+            for (ggml_tensor * t : { layer.k, layer.v }) {
+                if (!llama_kv_tensor_on_device(t)) {
+                    continue;
+                }
+
+                const size_t n = (size_t) rows[s]*t->nb[1];
+                ggml_backend_tensor_get(t, host.get() + off, s*t->nb[2], n);
+                off += n;
+            }
+        }
+    }
+    GGML_ASSERT(off == n_bytes);
+
+    size_t n_freed = 0;
+    for (size_t i = 0; i < ctxs_bufs.size(); ++i) {
+        if (!bufs[i].buft) {
+            continue;
+        }
+
+        ggml_context * ctx = ctxs_bufs[i].first.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+
+        ctxs_bufs[i].second.reset();
+        n_freed += bufs[i].size;
+    }
+
+    susp_bufs  = std::move(bufs);
+    susp_rows  = std::move(rows);
+    susp_host  = std::move(host);
+    susp_bytes = n_bytes;
+    suspended  = true;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        LLAMA_LOG_DEBUG("%s: stream %u: %u live rows\n", __func__, s, susp_rows[s]);
+    }
+    LLAMA_LOG_DEBUG("%s: copied %.2f MiB to host, released %.2f MiB of device memory\n", __func__,
+            susp_bytes/1024.0/1024.0, n_freed/1024.0/1024.0);
+
+    return true;
+}
+
+bool llama_kv_cache::gpu_resume() {
+    if (!suspended) {
+        return true;
+    }
+
+    size_t n_alloc = 0;
+    for (size_t i = 0; i < ctxs_bufs.size(); ++i) {
+        const auto & sb = susp_bufs[i];
+        if (!sb.buft || ctxs_bufs[i].second) {
+            continue;
+        }
+
+        ggml_context * ctx = ctxs_bufs[i].first.get();
+
+        // sizes only the non-view tensors with data == NULL and re-inits the views after their base tensor
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, sb.buft);
+        if (!buf) {
+            // the buffer allocation fails before any tensor is touched, so this can be retried
+            LLAMA_LOG_WARN("%s: failed to allocate %s KV buffer of %.2f MiB\n", __func__,
+                    ggml_backend_buft_name(sb.buft), sb.size/1024.0/1024.0);
+            return false;
+        }
+
+        GGML_ASSERT(ggml_backend_buffer_get_size(buf) == sb.size);
+
+        // initialize the buffer to avoid NaNs in the free and padded cells
+        ggml_backend_buffer_clear(buf, 0);
+        ctxs_bufs[i].second.reset(buf);
+        n_alloc += sb.size;
+    }
+
+    size_t off = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (susp_rows[s] == 0) {
+            continue;
+        }
+
+        for (const auto & layer : layers) {
+            for (ggml_tensor * t : { layer.k, layer.v }) {
+                if (!llama_kv_tensor_on_device(t)) {
+                    continue;
+                }
+
+                const size_t n = (size_t) susp_rows[s]*t->nb[1];
+                ggml_backend_tensor_set(t, susp_host.get() + off, s*t->nb[2], n);
+                off += n;
+            }
+        }
+    }
+    GGML_ASSERT(off == susp_bytes);
+
+    LLAMA_LOG_DEBUG("%s: re-allocated %.2f MiB of device memory, restored %.2f MiB\n", __func__,
+            n_alloc/1024.0/1024.0, susp_bytes/1024.0/1024.0);
+
+    susp_bufs.clear();
+    susp_rows.clear();
+    susp_host.reset();
+    susp_bytes = 0;
+    suspended  = false;
+
+    return true;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -685,6 +871,10 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
+        if (!buf) {
+            continue; // device memory suspended
+        }
+
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
         if (hparams.no_alloc) {
@@ -819,6 +1009,8 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     if (other) {
         return true;
     }
+
+    GGML_ASSERT(!suspended && "kv cache update while device memory is suspended");
 
     bool updated = false;
 
@@ -1893,7 +2085,9 @@ size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
     for (const auto & [_, buf] : ctxs_bufs) {
-        size += ggml_backend_buffer_get_size(buf.get());
+        if (buf) {
+            size += ggml_backend_buffer_get_size(buf.get());
+        }
     }
 
     return size;
@@ -2051,6 +2245,10 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (suspended) {
+        throw std::runtime_error("llama_kv_cache: state not available while device memory is suspended");
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2130,6 +2328,10 @@ void llama_kv_cache::state_read_sinfo(
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
+    if (suspended) {
+        throw std::runtime_error("llama_kv_cache: state not available while device memory is suspended");
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;

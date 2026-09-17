@@ -58,6 +58,11 @@ struct llama_context {
 
     void synchronize();
 
+    // [EXPERIMENTAL] release/restore the device memory of the memory module and the compute buffers (see llama-ext.h)
+    bool gpu_suspend();
+    bool gpu_resume();
+    bool gpu_is_suspended() const { return gpu_suspended; }
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -347,6 +352,8 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    bool gpu_suspended = false; // between gpu_suspend() and a successful gpu_resume()
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
