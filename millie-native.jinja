@@ -1,0 +1,66 @@
+{#- Native conversation format. Assistant tool calls use XML:
+    <tool_call><function=NAME><parameter=K>VALUE</parameter>...</function></tool_call>
+    Parameter values are raw; arguments may be a JSON string or object.
+    Consecutive tool results share a user turn as <tool_response> blocks.
+    Assistant reasoning is retained only after the last user turn.
+    The generation prompt opens <think>. Results are associated with calls
+    positionally, without an id key. -#}
+{%- set ns = namespace(last_query_index=-1) -%}
+{%- for message in messages -%}
+{%- if message.role == 'user' -%}
+{%- set ns.last_query_index = loop.index0 -%}
+{%- endif -%}
+{%- endfor -%}
+{%- for message in messages -%}
+{%- if message.role == 'system' -%}
+<|im_start|>system
+{{ message.content }}<|im_end|>
+{% elif message.role == 'user' -%}
+<|im_start|>user
+{{ message.content }}<|im_end|>
+{% elif message.role == 'tool' -%}
+{%- if loop.previtem is defined and loop.previtem.role == 'tool' -%}
+{{ "\n" }}<tool_response>
+{{ message.content }}
+</tool_response>
+{%- if not (loop.nextitem is defined and loop.nextitem.role == 'tool') %}<|im_end|>
+{% endif -%}
+{%- else -%}
+<|im_start|>user
+<tool_response>
+{{ message.content }}
+</tool_response>
+{%- if not (loop.nextitem is defined and loop.nextitem.role == 'tool') %}<|im_end|>
+{% endif -%}
+{%- endif -%}
+{% elif message.role == 'assistant' -%}
+<|im_start|>assistant
+{% if loop.index0 > ns.last_query_index -%}
+<think>
+{{ message.reasoning_content | default('', true) }}
+</think>
+
+{% endif -%}
+{{ message.content | default('', true) }}
+{%- if message.tool_calls -%}
+{%- for tc in message.tool_calls -%}
+{%- if (message.content | default('', true)) or not loop.first -%}
+{{ "\n\n" if loop.first else "\n" }}
+{%- endif -%}
+<tool_call>
+<function={{ tc.function.name }}>
+{%- for k, v in tc.function.arguments | items -%}
+{{ "\n" }}<parameter={{ k }}>
+{{ v if v is string else v | tojson }}
+</parameter>
+{%- endfor -%}
+{{ "\n" }}</function>
+</tool_call>
+{%- endfor -%}
+{%- endif -%}<|im_end|>
+{% endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+<|im_start|>assistant
+<think>
+{% endif -%}

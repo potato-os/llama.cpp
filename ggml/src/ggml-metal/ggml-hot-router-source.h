@@ -1,0 +1,38 @@
+// Copyright (c) 2026 LLMs For All, Inc.
+// SPDX-License-Identifier: MIT
+
+#pragma once
+static const char * hot_router_source =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct HotState { int capacity; float bias; int tokens; int miss_count; int queue[256]; int slots[256]; int request_expert[8]; int request_slot[8]; };\n"
+"kernel void hot_route(device const float *logits [[buffer(0)]], device int *out [[buffer(1)]], device HotState &s [[buffer(2)]], uint tid [[thread_index_in_threadgroup]]) {\n"
+"  threadgroup float scores[256]; threadgroup int ids[256];\n"
+"  scores[tid] = logits[tid]+(s.slots[tid]>=0 ? s.bias : 0.0f);\n"
+"  ids[tid]=int(tid); threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  for(uint k=2;k<=256;k*=2) for(uint j=k/2;j>0;j/=2) {\n"
+"    uint other=tid^j;\n"
+"    if(other>tid) {\n"
+"      bool swap=(tid&k)==0 ? scores[ids[tid]]<scores[ids[other]] : scores[ids[tid]]>scores[ids[other]];\n"
+"      if(swap) { int tmp=ids[tid]; ids[tid]=ids[other]; ids[other]=tmp; }\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  }\n"
+"  if(tid==0) {\n"
+"    int next[256]; bool selected[256]; bool keep[256]; int free_slots[8];\n"
+"    for(int e=0;e<256;e++) {selected[e]=false;keep[e]=false;}\n"
+"    for(int i=0;i<8;i++) {next[i]=ids[i];selected[ids[i]]=true;}\n"
+"    int count=8;\n"
+"    for(int i=0;i<s.capacity && count<s.capacity;i++) if(!selected[s.queue[i]]) next[count++]=s.queue[i];\n"
+"    for(int i=0;i<s.capacity;i++) keep[next[i]]=true;\n"
+"    int nfree=0;\n"
+"    for(int i=0;i<s.capacity;i++) if(!keep[s.queue[i]]) {free_slots[nfree++]=s.slots[s.queue[i]];s.slots[s.queue[i]]=-1;}\n"
+"    s.miss_count=0;\n"
+"    for(int i=0;i<8;i++) {int e=ids[i];if(s.slots[e]<0) {int slot=free_slots[--nfree];s.slots[e]=slot;s.request_expert[s.miss_count]=e;s.request_slot[s.miss_count++]=slot;}}\n"
+"    for(int i=0;i<s.capacity;i++) s.queue[i]=next[i];\n"
+"    for(int i=0;i<8;i++) {out[i]=ids[i];\n"
+"      out[8+i]=s.slots[ids[i]];\n"
+"    }\n"
+"    s.tokens++;\n"
+"  }\n"
+"}\n";

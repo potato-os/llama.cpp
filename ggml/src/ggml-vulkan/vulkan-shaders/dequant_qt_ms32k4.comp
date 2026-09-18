@@ -1,0 +1,44 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_qt_ms32k4 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    // one thread per sub-block, 32 blocks per workgroup
+    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
+
+    if (ib >= p.nel / 256) {
+        return;
+    }
+
+    const uint s = gl_LocalInvocationID.x % 8;
+    const uint scb = uint(data_a[ib].scales[s >> 1]);
+    const float dsc = float(data_a[ib].d) * float((s & 1) != 0 ? (scb >> 4) : (scb & 0xF));
+
+    // sign index of this sub-block's first non-zero: popcount of the
+    // preceding 4 mask bytes per earlier sub-block
+    uint sidx = 0;
+    [[unroll]] for (uint t = 0; t < 8; ++t) {
+        if (t < s) {
+            sidx += bitCount(uint(data_a[ib].mask[4*t    ]))
+                  + bitCount(uint(data_a[ib].mask[4*t + 1]))
+                  + bitCount(uint(data_a[ib].mask[4*t + 2]))
+                  + bitCount(uint(data_a[ib].mask[4*t + 3]));
+        }
+    }
+
+    const uint b_idx = 256 * ib + 32 * s;
+    [[unroll]] for (uint j = 0; j < 32; ++j) {
+        const uint bit = 32 * s + j;
+        float v = 0.0f;
+        if (((uint(data_a[ib].mask[bit >> 3]) >> (bit & 7)) & 1u) != 0) {
+            v = ((uint(data_a[ib].signs[sidx >> 3]) >> (sidx & 7)) & 1u) != 0 ? -dsc : dsc;
+            sidx++;
+        }
+        data_b[b_idx + j] = D_TYPE(v);
+    }
+}
