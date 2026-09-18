@@ -235,6 +235,8 @@ jobs:
           )
           set "BUDGET_MSG=!LF!!LF!Thinking budget reached. Stop deliberating now: state the approach in one or two sentences and write the complete final code.!LF!"
           python -c "import sys, json; print(json.dumps(sys.argv[1:]))" --reasoning-budget-message "!BUDGET_MSG!" > "%RUNNER_TEMP%\argv.json"
+          set "LLAMA_ARG_THINK_BUDGET_MESSAGE=!BUDGET_MSG!"
+          python -c "import os, json; print(json.dumps(os.environ['LLAMA_ARG_THINK_BUDGET_MESSAGE']))" > "%RUNNER_TEMP%\env.json"
           llama-server.exe -m "%RUNNER_TEMP%\tiny.gguf" -c 256 --port 8099 --no-webui --jinja ^
             --chat-template-kwargs "{\"preserve_thinking\": false, \"reasoning_effort\": \"medium\"}" ^
             --reasoning-budget 16384 --reasoning-budget-message "!BUDGET_MSG!"
@@ -253,6 +255,8 @@ jobs:
             $want = "`n`nThinking budget reached. Stop deliberating now: state the approach in one or two sentences and write the complete final code.`n"
             Write-Host "budget message as received: $(ConvertTo-Json $argv[1])"
             if ($argv[1] -cne $want) { throw "budget message mangled by cmd.exe" }
+            $envmsg = Get-Content $env:RUNNER_TEMP\env.json -Raw | ConvertFrom-Json
+            if ($envmsg -cne $want) { throw "budget message mangled in LLAMA_ARG_THINK_BUDGET_MESSAGE" }
             $r = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8099/completion -ContentType 'application/json' -Body '{"prompt":"One day","n_predict":16}'
             if (-not $r.content) { throw "empty completion" }
             Write-Host "completion: $($r.content)"
@@ -260,6 +264,54 @@ jobs:
             Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
             Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
             Remove-Item serve-test.bat -ErrorAction SilentlyContinue
+          }
+
+      - name: Serve scripts shipped on the model cards
+        shell: pwsh
+        run: |
+          # potato/windows/serve-potato-*.bat are uploaded to the Hugging Face repos as serve-potato.bat.
+          # Case a: empty folder -> clear message, exit 1, no hang (pause reads EOF from stdin).
+          # Case b: binaries but no model -> clear message, exit 1.
+          # Case c: all files present (tiny stand-ins) -> the script launches llama-server.exe with its full argument list;
+          #         every flag must be accepted, and the script must report the stop and return.
+          $ErrorActionPreference = 'Stop'
+          $rel = (Resolve-Path .\build\bin\Release).Path
+          $empty = "$env:RUNNER_TEMP\empty.txt"; Set-Content -Path $empty -Value $null
+          function Invoke-Bat([string]$dir) {
+            $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', "`"$dir\serve-potato.bat`"" -WorkingDirectory $env:RUNNER_TEMP `
+                   -PassThru -RedirectStandardInput $empty -RedirectStandardOutput "$dir.out" -RedirectStandardError "$dir.err"
+            if (-not $p.WaitForExit(180000)) {
+              Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              $p.WaitForExit(); $hung = $true
+            } else { $hung = $false }
+            $out = (Get-Content "$dir.out" -Raw) + (Get-Content "$dir.err" -Raw)
+            return @{ code = $p.ExitCode; out = $out; hung = $hung }
+          }
+          $files = @{
+            '24gb' = @('IQ4_XS\Potato-CODER-24GB-IQ4_XS.gguf', 'mmproj-Potato-CODER-24GB-Q8_0.gguf')
+            '48gb' = @('IQ4_XS\Potato-CODER-48GB-IQ4_XS-00001-of-00002.gguf', 'IQ4_XS\Potato-CODER-48GB-IQ4_XS-00002-of-00002.gguf',
+                       'MTP\mtp-Potato-CODER-48GB-shared-Q3_K_M.gguf', 'mmproj-Potato-CODER-48GB-Q8_0.gguf')
+          }
+          foreach ($m in @('24gb', '48gb')) {
+            $src = "potato\windows\serve-potato-$m.bat"
+            # a: folder name with spaces and parentheses, like "Downloads (1)"
+            $a = "$env:RUNNER_TEMP\bat $m (a)"; New-Item -ItemType Directory -Force $a | Out-Null
+            Copy-Item $src "$a\serve-potato.bat"
+            $r = Invoke-Bat $a
+            if ($r.hung -or $r.code -ne 1 -or $r.out -notmatch 'llama-server\.exe not found') { Write-Host $r.out; throw "$m case a failed" }
+            # b
+            $b = "$env:RUNNER_TEMP\bat $m (b)"; New-Item -ItemType Directory -Force $b | Out-Null
+            Copy-Item "$rel\*" $b -Recurse; Copy-Item $src "$b\serve-potato.bat"
+            $r = Invoke-Bat $b
+            if ($r.hung -or $r.code -ne 1 -or $r.out -notmatch 'model file not found') { Write-Host $r.out; throw "$m case b failed" }
+            # c
+            foreach ($f in $files[$m]) { New-Item -ItemType Directory -Force (Split-Path "$b\$f") | Out-Null; Copy-Item "$env:RUNNER_TEMP\tiny.gguf" "$b\$f" }
+            $r = Invoke-Bat $b
+            Write-Host "---- $m case c output (tail)"; ($r.out -split "`n" | Select-Object -Last 15) -join "`n" | Write-Host
+            if ($r.out -notmatch 'Starting Potato-CODER') { throw "$m case c: the script did not reach llama-server" }
+            if ($r.out -match 'error: invalid argument') { throw "$m case c: llama-server rejected an argument" }
+            if (-not $r.hung -and $r.out -notmatch 'The server has stopped') { throw "$m case c: no stop notice" }
           }
 
       - name: Pack
