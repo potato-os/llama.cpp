@@ -225,10 +225,19 @@ jobs:
           $gen = (& .\llama-completion.exe -m $env:RUNNER_TEMP\tiny.gguf -p "One day, Lily" -n 32 -c 256 -no-cnv --seed 1 2>$null | Out-String)
           Write-Host $gen
           if ($gen.Length -lt 40) { throw "generation too short" }
-          # same cmd.exe quoting of the JSON argument as the serve-potato.bat on the model card
+          # same cmd.exe quoting as the serve-potato.bat on the model card: the JSON argument, and the thinking-budget
+          # message, whose line feeds cmd cannot type (built with the LF-variable idiom under delayed expansion)
           $bat = @'
+          @echo off
+          setlocal EnableDelayedExpansion
+          (set LF=^
+          %=empty=%
+          )
+          set "BUDGET_MSG=!LF!!LF!Thinking budget reached. Stop deliberating now: state the approach in one or two sentences and write the complete final code.!LF!"
+          python -c "import sys, json; print(json.dumps(sys.argv[1:]))" --reasoning-budget-message "!BUDGET_MSG!" > "%RUNNER_TEMP%\argv.json"
           llama-server.exe -m "%RUNNER_TEMP%\tiny.gguf" -c 256 --port 8099 --no-webui --jinja ^
-            --chat-template-kwargs "{\"preserve_thinking\": false, \"reasoning_effort\": \"medium\"}"
+            --chat-template-kwargs "{\"preserve_thinking\": false, \"reasoning_effort\": \"medium\"}" ^
+            --reasoning-budget 16384 --reasoning-budget-message "!BUDGET_MSG!"
           '@
           ($bat -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`r`n" | Out-File -Encoding ascii serve-test.bat
           $srv = Start-Process -FilePath cmd.exe -ArgumentList '/c', 'serve-test.bat' `
@@ -239,6 +248,11 @@ jobs:
               try { Invoke-RestMethod http://127.0.0.1:8099/health | Out-Null; $ok = $true; break } catch { Start-Sleep 1 }
             }
             if (-not $ok) { Get-Content $env:RUNNER_TEMP\srv.err; throw "server did not become healthy" }
+            # the budget message must reach a CRT argv parser byte for byte, line feeds included
+            $argv = Get-Content $env:RUNNER_TEMP\argv.json -Raw | ConvertFrom-Json
+            $want = "`n`nThinking budget reached. Stop deliberating now: state the approach in one or two sentences and write the complete final code.`n"
+            Write-Host "budget message as received: $(ConvertTo-Json $argv[1])"
+            if ($argv[1] -cne $want) { throw "budget message mangled by cmd.exe" }
             $r = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8099/completion -ContentType 'application/json' -Body '{"prompt":"One day","n_predict":16}'
             if (-not $r.content) { throw "empty completion" }
             Write-Host "completion: $($r.content)"
