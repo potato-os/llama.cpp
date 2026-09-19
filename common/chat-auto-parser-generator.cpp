@@ -340,6 +340,56 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
            p.end();
 }
 
+// Which non-string JSON types a parameter schema admits, through type / type[] / anyOf / oneOf / allOf, plus the
+// structural hints "properties" (object) and "items" (array). Port of ggml-org/llama.cpp#28742 (typed parsing of
+// complex tool-argument types) for the tagged-argument format (<parameter=name>value</parameter>).
+static void tagged_arg_collect_non_string_types(const json & s, bool & obj, bool & arr, bool & num, bool & boolean,
+                                                bool & null, int depth = 0) {
+    if (!s.is_object() || depth > 16) {
+        return;
+    }
+    auto mark = [&](const json & t) {
+        if (!t.is_string()) {
+            return;
+        }
+        const std::string ts = t;
+        if (ts == "object") {
+            obj = true;
+        } else if (ts == "array") {
+            arr = true;
+        } else if (ts == "number" || ts == "integer") {
+            num = true;
+        } else if (ts == "boolean") {
+            boolean = true;
+        } else if (ts == "null") {
+            null = true;
+        }
+    };
+    if (s.contains("type")) {
+        const json & t = s.at("type");
+        if (t.is_array()) {
+            for (const auto & x : t) {
+                mark(x);
+            }
+        } else {
+            mark(t);
+        }
+    }
+    if (s.contains("properties") && !s.contains("type")) {
+        obj = true;
+    }
+    if (s.contains("items") && !s.contains("type")) {
+        arr = true;
+    }
+    for (const char * key : { "anyOf", "oneOf", "allOf" }) {
+        if (s.contains(key) && s.at(key).is_array()) {
+            for (const auto & alt : s.at(key)) {
+                tagged_arg_collect_non_string_types(alt, obj, arr, num, boolean, null, depth + 1);
+            }
+        }
+    }
+}
+
 common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
@@ -369,18 +419,46 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         for (const auto & [param_name, param_schema] : properties.items()) {
             bool is_required = required.find(param_name) != required.end();
 
-            auto arg =
-                p.tool_arg(p.tool_arg_open(arguments.name_prefix + p.tool_arg_name(p.literal(param_name)) +
-                                           arguments.name_suffix) +
-                           arguments.value_prefix +
-                           (schema_info.resolves_to_string(param_schema) ?
-                                p.tool_arg_string_value(p.schema(until_suffix,
-                                                                 "tool-" + name + "-arg-" + param_name + "-schema",
-                                                                 param_schema, true)) :
-                                p.tool_arg_json_value(p.schema(
-                                    p.json(), "tool-" + name + "-arg-" + param_name + "-schema", param_schema, false)) +
-                                    p.space()) +
-                           p.tool_arg_close(p.literal(arguments.value_suffix)));
+            const std::string schema_name = "tool-" + name + "-arg-" + param_name + "-schema";
+            auto              arg_close   = p.tool_arg_close(p.literal(arguments.value_suffix));
+            auto              string_value =
+                p.tool_arg_string_value(p.schema(until_suffix, schema_name, param_schema, true)) + arg_close;
+
+            // Port of ggml-org/llama.cpp#28742: a parameter that may be a string AND an object/array/number/bool/null
+            // used to be parsed as a raw string, so e.g. a string|object union came back as a JSON-encoded string.
+            // The JSON alternatives are now tried first (atomically, including the closing tag) so the value keeps
+            // its type; any other text still falls back to the raw string.
+            bool t_obj = false, t_arr = false, t_num = false, t_bool = false, t_null = false;
+            tagged_arg_collect_non_string_types(param_schema, t_obj, t_arr, t_num, t_bool, t_null);
+            common_peg_parser arg_value = p.eps();
+            if (!schema_info.resolves_to_string(param_schema)) {
+                arg_value = p.tool_arg_json_value(p.schema(p.json(), schema_name, param_schema, false)) + p.space() +
+                            arg_close;
+            } else if (!(t_obj || t_arr || t_num || t_bool || t_null)) {
+                arg_value = string_value;
+            } else {
+                auto json_alts = p.choice();
+                if (t_obj) {
+                    json_alts |= p.json_object();
+                }
+                if (t_arr) {
+                    json_alts |= p.json_array();
+                }
+                if (t_num) {
+                    json_alts |= p.json_number();
+                }
+                if (t_bool) {
+                    json_alts |= p.json_bool();
+                }
+                if (t_null) {
+                    json_alts |= p.json_null();
+                }
+                arg_value = p.atomic(p.tool_arg_json_value(json_alts) + p.space() + arg_close) | string_value;
+            }
+
+            auto arg = p.tool_arg(p.tool_arg_open(arguments.name_prefix + p.tool_arg_name(p.literal(param_name)) +
+                                                  arguments.name_suffix) +
+                                  arguments.value_prefix + arg_value);
 
             auto named_arg = p.rule("tool-" + name + "-arg-" + param_name, arg);
             if (is_required) {
