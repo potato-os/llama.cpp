@@ -8877,7 +8877,14 @@ static const ggml_type base_types[] = {
     GGML_TYPE_Q4_1, // for I8MM tests
     GGML_TYPE_Q4_K,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, // TODO: or "other"
-    GGML_TYPE_IQ2_XXS
+    GGML_TYPE_IQ2_XXS,
+    // Ternary is excluded from all_types/other_types upstream ("TODO: implement
+    // for all backends"), which leaves MUL_MAT/MUL_MAT_ID for tq2_0 with zero
+    // automated coverage -- backends that do implement it are never checked
+    // against the CPU reference. Enabled here because this fork's whole purpose
+    // is a ternary model. Backends lacking support report "not supported" and
+    // are skipped, so this does not create false failures.
+    GGML_TYPE_TQ2_0,
 };
 
 static const ggml_type other_types[] = {
