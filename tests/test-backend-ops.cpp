@@ -8271,6 +8271,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Tail dimensions across dispatch boundaries and broadcast sample/channel strides.
+    for (int64_t k : {256, 512, 768, 1280, 2048}) {
+        for (int64_t n : {2, 3, 8, 31, 32, 33}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 7, n, k, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 4, 2, false, 7, n, k));
+        }
+    }
+    for (auto r : {std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{2, 2}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 7, 1, 768, {2, 2}, r));
+    }
+
+    // QT_MS32K4 at Millie's expert shapes (gate/up k = 2048 -> 512, down k = 512 -> 2048, 8 of 16 experts): decode,
+    // MTP-verify-sized and prefill batches; odd row counts and k = 768 / 1280 for the bounds of the batch-1 kernels.
+    for (int n : {1, 2, 3, 8, 33, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 16, 8, true,  512, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 16, 8, false, 2048, n, 512));
+    }
+    for (int64_t m : {1, 7, 200, 520}) {
+        for (int64_t k : {512, 768, 1280, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 4, 2, false, m, 1, k));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+        }
+    }
+    for (bool b : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_QT_MS32K4, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 16, 8, b));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_QT_MS32K4, GGML_GLU_OP_SWIGLU, 1, 200, 768, true, 16, 8, b));
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_QT_MS32K4, GGML_GLU_OP_SWIGLU, 1, 520, 1280));
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4}) {
@@ -8976,6 +9005,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // Millie-1.1-35B-A3B (QT_MS32K4 experts, 256 of them, 8 used): fused gate/up + SwiGLU (k 2048 -> 512) and down (512 -> 2048)
+    for (int bs : {1, 2, 4, 512}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_QT_MS32K4, GGML_GLU_OP_SWIGLU, bs, 512, 2048, true, 256, 8, true));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_QT_MS32K4, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512));
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {

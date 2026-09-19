@@ -868,6 +868,65 @@ static __device__ __forceinline__ float vec_dot_q1_sym32k_q8_1(
     return 0.5f * d * (float) sc * d8 * (float) sumi;
 }
 
+// QT_MS32K4: ternary weights as a 1-bit non-zero mask per weight plus one sign bit per non-zero.
+// The sign stream is per BLOCK (exactly 128 non-zeros per 256 weights), so a sub-block's signs start at
+// the popcount of all preceding mask bits in the block. Values are integral (-1/0/+1), so dp4a against
+// q8_1 is exact; the scale is d * sc per 32-elem sub-block.
+
+// Four mask bits n (bit j set = element j non-zero) and a sign stream sw (LSB = sign of the next
+// non-zero, 1 = negative) -> int8x4 lanes of +1 / -1 / 0; consumes popc(n) sign bits.
+static __device__ __forceinline__ int qt_ms32k4_lanes(const int n, uint32_t & sw) {
+    const uint32_t b0 = n & 1, b1 = (n >> 1) & 1, b2 = (n >> 2) & 1, b3 = (n >> 3) & 1;
+    const uint32_t c1 = b0, c2 = c1 + b1, c3 = c2 + b2;
+    const uint32_t neg = (b0 & sw) | ((b1 & (sw >> c1)) << 1) | ((b2 & (sw >> c2)) << 2) | ((b3 & (sw >> c3)) << 3);
+    sw >>= c3 + b3;
+    const int m  = (n          * 0x00204081) & 0x01010101;   // bit j -> byte lane j
+    const int ng = ((int) neg  * 0x00204081) & 0x01010101;
+    // Each byte of ng is 0/1 and is a subset of m: XOR maps 1 to 0xFF without byte borrows.
+    return int(uint32_t(m) ^ (uint32_t(ng) * 0xFEu));
+}
+
+// 32 sign bits of block b starting at sign index `start` (in-block, fixed-offset 16-bit loads).
+static __device__ __forceinline__ uint32_t qt_ms32k4_sign_window(const block_qt_ms32k4 * b, const int start) {
+    const uint16_t * s16 = (const uint16_t *) b->signs;
+    const int i  = start >> 4;
+    const int sh = start & 15;
+    const uint32_t lo = (uint32_t) s16[min(i, 7)] | ((uint32_t) s16[min(i + 1, 7)] << 16);
+    const uint32_t hi = (uint32_t) s16[min(i + 2, 7)];
+    return sh == 0 ? lo : (lo >> sh) | (hi << (32 - sh));
+}
+
+#define VDR_QT_MS32K4_Q8_1_MMVQ 1
+
+static __device__ __forceinline__ float vec_dot_qt_ms32k4_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    // One call (iqs = sub-block 0..7) covers one 32-elem sub-block = one q8_1 block.
+    const block_qt_ms32k4 * bq = (const block_qt_ms32k4 *) vbq + kbx;
+    const int s = iqs;
+
+    int start = 0;
+#pragma unroll
+    for (int t = 0; t < QKT_MS32K_SUPER - 1; ++t) {
+        if (t < s) {
+            start += __popc(get_int_b2(bq->mask, t));
+        }
+    }
+    const int m  = get_int_b2(bq->mask, s);
+    uint32_t  sw = qt_ms32k4_sign_window(bq, start);
+
+    const block_q8_1 * b8 = bq8_1 + s;
+    int sumi = 0;
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const int w = qt_ms32k4_lanes((m >> (4*t)) & 0x0F, sw);
+        sumi = ggml_cuda_dp4a(w, get_int_b4(b8->qs, t), sumi);
+    }
+
+    const uint8_t sc = (s & 1) ? (bq->scales[s >> 1] >> 4) : (bq->scales[s >> 1] & 0x0F);
+    return __half2float(bq->d) * (float) sc * __low2float(b8->ds) * (float) sumi;
+}
+
 #define VDR_Q4_SYM16K_Q8_1_MMVQ 2
 
 static __device__ __forceinline__ float vec_dot_q4_sym16k_q8_1(

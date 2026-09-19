@@ -16,6 +16,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q2_SYM32K4: return vec_dot_q2_sym32k4_q8_1;
         case GGML_TYPE_Q1_SYM32K: return vec_dot_q1_sym32k_q8_1;
         case GGML_TYPE_Q4_SYM16K: return vec_dot_q4_sym16k_q8_1;
+        case GGML_TYPE_QT_MS32K4: return vec_dot_qt_ms32k4_q8_1;
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
@@ -48,6 +49,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q2_SYM32K4: return VDR_Q2_SYM32K4_Q8_1_MMVQ;
         case GGML_TYPE_Q1_SYM32K: return VDR_Q1_SYM32K_Q8_1_MMVQ;
         case GGML_TYPE_Q4_SYM16K: return VDR_Q4_SYM16K_Q8_1_MMVQ;
+        case GGML_TYPE_QT_MS32K4: return VDR_QT_MS32K4_Q8_1_MMVQ;
         case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
@@ -733,6 +735,441 @@ static void mul_mat_vec_q_moe_launch(
         ncols_dst, ids_stride);
 }
 
+// QT_MS32K4 batch-1 decode (ncols_dst == 1, incl. MUL_MAT_ID ids and the fused gate/GLU path).
+// The generic kernel spreads 128 threads over K, which leaves most lanes idle on the narrow MoE expert matrices
+// (K = 512 / 2048 = 16 / 64 sub-blocks) and makes every lane re-read the preceding mask words for its sign start.
+// Here a row is owned by 16 or 32 lanes (warp-per-row small-K geometry), each lane handles one 32-elem sub-block
+// per step, the sign start comes from an 8-lane segmented shuffle scan over the lanes of the same 256-elem block
+// (lanes_per_row is a multiple of 8, so lane % 8 == sub-block index), and rows are reduced with shuffles only.
+template <bool has_fusion, int lanes_per_row>
+__launch_bounds__(4*32, 1)
+static __global__ void mul_mat_vec_qt_ms32k4_rows(
+        const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
+        const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x,
+        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+    static_assert(lanes_per_row % 8 == 0 && 32 % lanes_per_row == 0, "lanes_per_row must be 8, 16 or 32");
+    constexpr int rows_per_warp = 32 / lanes_per_row;
+
+    const int lane    = threadIdx.x;
+    const int l       = lane % lanes_per_row;
+    const uint32_t row = (blockIdx.x*blockDim.y + threadIdx.y)*rows_per_warp + lane / lanes_per_row;
+    const bool row_ok = row < nrows_x;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t channel_x   = ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y   = ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y    = sample_dst;
+
+    const block_q8_1 * y = (const block_q8_1 *) vy + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    const uint32_t xoff  = sample_x*stride_sample_x + channel_x*stride_channel_x + (row_ok ? row : 0)*stride_row_x;
+    const block_qt_ms32k4 * x  = (const block_qt_ms32k4 *) vx + xoff;
+    const block_qt_ms32k4 * xg = nullptr;
+    if constexpr (has_fusion) {
+        if (fusion.gate != nullptr) {
+            xg = (const block_qt_ms32k4 *) fusion.gate + xoff;
+        }
+    }
+
+    const int nsub = ncols_x / QKT_MS32K_SUB;   // multiple of 8
+    float acc = 0.0f, accg = 0.0f;
+
+    for (int s0 = 0; s0 < nsub; s0 += lanes_per_row) {   // bound is uniform across the warp: shuffles stay convergent
+        const int  s      = s0 + l;
+        const bool active = row_ok && s < nsub;
+        const int  ib     = s >> 3;
+        const int  sb     = s & 7;                        // == lane % 8
+
+        const int m   = active ? get_int_b2(x[ib].mask, sb) : 0;
+        const int own = __popc(m);
+        int incl = own;
+#pragma unroll
+        for (int o = 1; o < 8; o <<= 1) {
+            const int t = __shfl_up_sync(0xFFFFFFFF, incl, o, 8);
+            if (sb >= o) {
+                incl += t;
+            }
+        }
+        int mg = 0, inclg = 0, ownl = 0;
+        if constexpr (has_fusion) {
+            if (xg != nullptr) {
+                mg    = active ? get_int_b2(xg[ib].mask, sb) : 0;
+                ownl  = __popc(mg);
+                inclg = ownl;
+#pragma unroll
+                for (int o = 1; o < 8; o <<= 1) {
+                    const int t = __shfl_up_sync(0xFFFFFFFF, inclg, o, 8);
+                    if (sb >= o) {
+                        inclg += t;
+                    }
+                }
+            }
+        }
+
+        if (active) {
+            const block_q8_1 * b8 = y + s;
+            int u[8];
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                u[t] = get_int_b4(b8->qs, t);
+            }
+            const float d8 = __low2float(b8->ds);
+
+            uint32_t sw = qt_ms32k4_sign_window(&x[ib], incl - own);
+            int sumi = 0;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                sumi = ggml_cuda_dp4a(qt_ms32k4_lanes((m >> (4*t)) & 0x0F, sw), u[t], sumi);
+            }
+            const uint8_t scb = x[ib].scales[sb >> 1];
+            const float   sc  = (float) ((sb & 1) ? (scb >> 4) : (scb & 0x0F));
+            acc += __half2float(x[ib].d) * sc * d8 * (float) sumi;
+
+            if constexpr (has_fusion) {
+                if (xg != nullptr) {
+                    uint32_t swg = qt_ms32k4_sign_window(&xg[ib], inclg - ownl);
+                    int sumg = 0;
+#pragma unroll
+                    for (int t = 0; t < 8; ++t) {
+                        sumg = ggml_cuda_dp4a(qt_ms32k4_lanes((mg >> (4*t)) & 0x0F, swg), u[t], sumg);
+                    }
+                    const uint8_t scg = xg[ib].scales[sb >> 1];
+                    accg += __half2float(xg[ib].d) * (float) ((sb & 1) ? (scg >> 4) : (scg & 0x0F)) * d8 * (float) sumg;
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int o = lanes_per_row/2; o > 0; o >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, o, 32);
+        if constexpr (has_fusion) {
+            accg += __shfl_xor_sync(0xFFFFFFFF, accg, o, 32);
+        }
+    }
+
+    if (l != 0 || !row_ok) {
+        return;
+    }
+
+    float result = acc;
+    if constexpr (has_fusion) {
+        const uint32_t channel_bias = ids ? channel_x : channel_dst;
+        if (fusion.x_bias != nullptr) {
+            result += ((const float *) fusion.x_bias)[sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row];
+        }
+        if (fusion.gate != nullptr) {
+            float gate_value = accg;
+            if (fusion.gate_bias != nullptr) {
+                gate_value += ((const float *) fusion.gate_bias)[sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row];
+            }
+            switch (fusion.glu_op) {
+                case GGML_GLU_OP_SWIGLU:
+                    result *= ggml_cuda_op_silu_single(gate_value);
+                    break;
+                case GGML_GLU_OP_GEGLU:
+                    result *= ggml_cuda_op_gelu_single(gate_value);
+                    break;
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                    break;
+                default:
+                    result = result * gate_value;
+                    break;
+            }
+        }
+    }
+    dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row] = result;
+}
+
+static void mul_mat_vec_qt_ms32k4_rows_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x,
+        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
+    constexpr int nwarps = 4;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const int  nsub       = ncols_x / QKT_MS32K_SUB;
+    const dim3 block_dims(32, nwarps, 1);
+#define QT_ROWS_LAUNCH(FUS, LPR) do {                                                                        \
+        const int rows_per_block = nwarps * (32 / (LPR));                                                     \
+        const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, nchannels_dst, nsamples_dst);  \
+        mul_mat_vec_qt_ms32k4_rows<FUS, LPR><<<block_nums, block_dims, 0, stream>>>(                          \
+            vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x, channel_ratio,             \
+            stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x,            \
+            stride_sample_y, stride_sample_dst);                                                              \
+    } while (0)
+    if (nsub <= 8) {
+        if (has_fusion) { QT_ROWS_LAUNCH(true,  8); } else { QT_ROWS_LAUNCH(false,  8); }
+    } else if (nsub <= 16) {
+        if (has_fusion) { QT_ROWS_LAUNCH(true, 16); } else { QT_ROWS_LAUNCH(false, 16); }
+    } else {
+        if (has_fusion) { QT_ROWS_LAUNCH(true, 32); } else { QT_ROWS_LAUNCH(false, 32); }
+    }
+#undef QT_ROWS_LAUNCH
+}
+
+// QT_MS32K4 batch-1 decode, LUT variant (default; GGML_CUDA_QT_NOLUT=1 selects the kernel above). Same warp-per-row
+// geometry, plus:
+// - a 256-entry int8x4 decode table in shared memory replaces the per-nibble sign scatter (~25 integer ops per 4 weights
+//   -> ~5 and one LDS); index = next 4 sign bits | mask nibble << 4, sign bits past popc(nibble) are don't-care;
+// - the sign cursor of every nibble comes from a SWAR nibble popcount + byte prefix sum (no serial __popc, which is
+//   quarter rate on sm_86);
+// - the 8 lanes of a block load its 8 sign words together with the mask words, and the 32-bit sign window comes from
+//   shuffles instead of a second global load that waits for the scan;
+// - each lane group handles rows_per_group rows (2: tg64 186.5 vs 185.2 t/s for 1 and 180.7 for 4), so a sub-block's
+//   activations are loaded once per group. Staging the activations in shared memory was tried and gave nothing.
+static __device__ const uint32_t qt_ms32k4_lut_tab[256] = {
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000001, 0x000000FF, 0x00000001, 0x000000FF, 0x00000001, 0x000000FF, 0x00000001, 0x000000FF,
+    0x00000001, 0x000000FF, 0x00000001, 0x000000FF, 0x00000001, 0x000000FF, 0x00000001, 0x000000FF,
+    0x00000100, 0x0000FF00, 0x00000100, 0x0000FF00, 0x00000100, 0x0000FF00, 0x00000100, 0x0000FF00,
+    0x00000100, 0x0000FF00, 0x00000100, 0x0000FF00, 0x00000100, 0x0000FF00, 0x00000100, 0x0000FF00,
+    0x00000101, 0x000001FF, 0x0000FF01, 0x0000FFFF, 0x00000101, 0x000001FF, 0x0000FF01, 0x0000FFFF,
+    0x00000101, 0x000001FF, 0x0000FF01, 0x0000FFFF, 0x00000101, 0x000001FF, 0x0000FF01, 0x0000FFFF,
+    0x00010000, 0x00FF0000, 0x00010000, 0x00FF0000, 0x00010000, 0x00FF0000, 0x00010000, 0x00FF0000,
+    0x00010000, 0x00FF0000, 0x00010000, 0x00FF0000, 0x00010000, 0x00FF0000, 0x00010000, 0x00FF0000,
+    0x00010001, 0x000100FF, 0x00FF0001, 0x00FF00FF, 0x00010001, 0x000100FF, 0x00FF0001, 0x00FF00FF,
+    0x00010001, 0x000100FF, 0x00FF0001, 0x00FF00FF, 0x00010001, 0x000100FF, 0x00FF0001, 0x00FF00FF,
+    0x00010100, 0x0001FF00, 0x00FF0100, 0x00FFFF00, 0x00010100, 0x0001FF00, 0x00FF0100, 0x00FFFF00,
+    0x00010100, 0x0001FF00, 0x00FF0100, 0x00FFFF00, 0x00010100, 0x0001FF00, 0x00FF0100, 0x00FFFF00,
+    0x00010101, 0x000101FF, 0x0001FF01, 0x0001FFFF, 0x00FF0101, 0x00FF01FF, 0x00FFFF01, 0x00FFFFFF,
+    0x00010101, 0x000101FF, 0x0001FF01, 0x0001FFFF, 0x00FF0101, 0x00FF01FF, 0x00FFFF01, 0x00FFFFFF,
+    0x01000000, 0xFF000000, 0x01000000, 0xFF000000, 0x01000000, 0xFF000000, 0x01000000, 0xFF000000,
+    0x01000000, 0xFF000000, 0x01000000, 0xFF000000, 0x01000000, 0xFF000000, 0x01000000, 0xFF000000,
+    0x01000001, 0x010000FF, 0xFF000001, 0xFF0000FF, 0x01000001, 0x010000FF, 0xFF000001, 0xFF0000FF,
+    0x01000001, 0x010000FF, 0xFF000001, 0xFF0000FF, 0x01000001, 0x010000FF, 0xFF000001, 0xFF0000FF,
+    0x01000100, 0x0100FF00, 0xFF000100, 0xFF00FF00, 0x01000100, 0x0100FF00, 0xFF000100, 0xFF00FF00,
+    0x01000100, 0x0100FF00, 0xFF000100, 0xFF00FF00, 0x01000100, 0x0100FF00, 0xFF000100, 0xFF00FF00,
+    0x01000101, 0x010001FF, 0x0100FF01, 0x0100FFFF, 0xFF000101, 0xFF0001FF, 0xFF00FF01, 0xFF00FFFF,
+    0x01000101, 0x010001FF, 0x0100FF01, 0x0100FFFF, 0xFF000101, 0xFF0001FF, 0xFF00FF01, 0xFF00FFFF,
+    0x01010000, 0x01FF0000, 0xFF010000, 0xFFFF0000, 0x01010000, 0x01FF0000, 0xFF010000, 0xFFFF0000,
+    0x01010000, 0x01FF0000, 0xFF010000, 0xFFFF0000, 0x01010000, 0x01FF0000, 0xFF010000, 0xFFFF0000,
+    0x01010001, 0x010100FF, 0x01FF0001, 0x01FF00FF, 0xFF010001, 0xFF0100FF, 0xFFFF0001, 0xFFFF00FF,
+    0x01010001, 0x010100FF, 0x01FF0001, 0x01FF00FF, 0xFF010001, 0xFF0100FF, 0xFFFF0001, 0xFFFF00FF,
+    0x01010100, 0x0101FF00, 0x01FF0100, 0x01FFFF00, 0xFF010100, 0xFF01FF00, 0xFFFF0100, 0xFFFFFF00,
+    0x01010100, 0x0101FF00, 0x01FF0100, 0x01FFFF00, 0xFF010100, 0xFF01FF00, 0xFFFF0100, 0xFFFFFF00,
+    0x01010101, 0x010101FF, 0x0101FF01, 0x0101FFFF, 0x01FF0101, 0x01FF01FF, 0x01FFFF01, 0x01FFFFFF,
+    0xFF010101, 0xFF0101FF, 0xFF01FF01, 0xFF01FFFF, 0xFFFF0101, 0xFFFF01FF, 0xFFFFFF01, 0xFFFFFFFF,
+};
+
+// int32 dot product of one 32-weight sub-block with 32 int8 activations u[0..7] (unscaled); dsc = d * sub-scale.
+// All 32 lanes of the warp must call it (shuffles); `active` must be uniform within each 8-lane group (one block).
+static __device__ __forceinline__ int qt_ms32k4_dot_lut(
+        const block_qt_ms32k4 * __restrict__ b, const int sb, const bool active, const int * u, const int * lut,
+        float & dsc) {
+    const uint16_t * p = (const uint16_t *) b;   // blocks are 54 B: 2-byte aligned
+    uint32_t m = 0, sg = 0;
+    dsc = 0.0f;
+    if (active) {
+        m  = (uint32_t) p[3 + 2*sb] | ((uint32_t) p[4 + 2*sb] << 16);   // mask bytes 6 + 4*sb
+        sg = p[19 + sb];                                                // sign bytes 38 + 2*sb
+        const uint8_t scb = b->scales[sb >> 1];
+        dsc = __half2float(b->d) * (float) ((sb & 1) ? (scb >> 4) : (scb & 0x0F));
+    }
+
+    uint32_t c = m - ((m >> 1) & 0x55555555u);
+    c = (c & 0x33333333u) + ((c >> 2) & 0x33333333u);          // nibble popcounts 0..4
+    const uint32_t ce   = c & 0x0F0F0F0Fu;                     // byte k: popcount of nibble 2k
+    const uint32_t cb   = ce + ((c >> 4) & 0x0F0F0F0Fu);       // byte k: popcount of mask byte k
+    const uint32_t incl = cb * 0x01010101u;                    // byte k: popcount of mask bytes 0..k (<= 32)
+    const uint32_t cur0 = incl - cb;                           // byte k: sign cursor of nibble 2k
+    const uint32_t cur1 = cur0 + ce;                           // byte k: sign cursor of nibble 2k+1
+    const int      own  = incl >> 24;
+
+    int scan = own;
+#pragma unroll
+    for (int o = 1; o < 8; o <<= 1) {
+        const int t = __shfl_up_sync(0xFFFFFFFF, scan, o, 8);
+        if (sb >= o) {
+            scan += t;
+        }
+    }
+    const int start = scan - own;                              // first sign index of this sub-block
+    const int i     = start >> 4;
+    const uint32_t w0 = __shfl_sync(0xFFFFFFFF, sg, i,              8);
+    const uint32_t w1 = __shfl_sync(0xFFFFFFFF, sg, min(i + 1, 7), 8);
+    const uint32_t w2 = __shfl_sync(0xFFFFFFFF, sg, min(i + 2, 7), 8);
+    const uint32_t sw = __funnelshift_r(w0 | (w1 << 16), w2, start & 15);   // sign bits start .. start+31
+    const uint32_t sw_lo = sw << 2, sw_hi = sw >> 30;          // sw * 4 as 64 bits: table byte offsets
+
+    int sumi = 0;
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const uint32_t cur  = __byte_perm((t & 1) ? cur1 : cur0, 0, 0x4440 | (t >> 1));
+        const uint32_t sgn4 = __funnelshift_r(sw_lo, sw_hi, cur) & 0x3C;                       // 4 sign bits * 4
+        const uint32_t nib4 = (t < 2 ? (m << (6 - 4*t)) : (m >> (4*t - 6))) & 0x3C0;           // nibble * 64
+        sumi = ggml_cuda_dp4a(*(const int *) ((const char *) lut + (sgn4 | nib4)), u[t], sumi);
+    }
+    return sumi;
+}
+
+template <bool has_fusion, int lanes_per_row, int rows_per_group>
+__launch_bounds__(4*32, 1)
+static __global__ void mul_mat_vec_qt_ms32k4_lut(
+        const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
+        const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x,
+        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+    static_assert(lanes_per_row % 8 == 0 && 32 % lanes_per_row == 0, "lanes_per_row must be 8, 16 or 32");
+    static_assert(rows_per_group <= lanes_per_row, "one writer lane per row");
+    constexpr int groups_per_warp = 32 / lanes_per_row;
+
+    __shared__ int lut[256];
+    {
+        const int tid = threadIdx.y*32 + threadIdx.x;   // blockDim = (32, 4)
+        lut[tid]       = (int) qt_ms32k4_lut_tab[tid];
+        lut[tid + 128] = (int) qt_ms32k4_lut_tab[tid + 128];
+    }
+
+    const int lane = threadIdx.x;
+    const int l    = lane % lanes_per_row;
+    const uint32_t row0 = ((blockIdx.x*blockDim.y + threadIdx.y)*groups_per_warp + lane / lanes_per_row) * rows_per_group;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t channel_x   = ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y   = ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y    = sample_dst;
+
+    const block_q8_1 * y = (const block_q8_1 *) vy + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    const uint32_t xoff  = sample_x*stride_sample_x + channel_x*stride_channel_x;
+    const block_qt_ms32k4 * x  = (const block_qt_ms32k4 *) vx + xoff;
+    const block_qt_ms32k4 * xg = nullptr;
+    if constexpr (has_fusion) {
+        if (fusion.gate != nullptr) {
+            xg = (const block_qt_ms32k4 *) fusion.gate + xoff;
+        }
+    }
+
+    const int nsub = ncols_x / QKT_MS32K_SUB;   // multiple of 8
+    float acc[rows_per_group]  = {0.0f};
+    float accg[rows_per_group] = {0.0f};
+
+    __syncthreads();
+
+    for (int s0 = 0; s0 < nsub; s0 += lanes_per_row) {   // bound is uniform across the warp: shuffles stay convergent
+        const int  s    = s0 + l;
+        const bool s_ok = s < nsub;
+        const int  ib   = s >> 3;
+        const int  sb   = s & 7;                           // == lane % 8
+
+        int   u[8] = {0};
+        float d8   = 0.0f;
+        if (s_ok) {
+            const block_q8_1 * b8 = y + s;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                u[t] = get_int_b4(b8->qs, t);
+            }
+            d8 = __low2float(b8->ds);
+        }
+
+#pragma unroll
+        for (int r = 0; r < rows_per_group; ++r) {
+            const uint32_t row    = row0 + r;
+            const bool     active = s_ok && row < nrows_x;
+            const uint32_t boff   = (row < nrows_x ? row : 0)*stride_row_x + ib;
+            float dsc;
+            const int sumi = qt_ms32k4_dot_lut(x + boff, sb, active, u, lut, dsc);
+            acc[r] += dsc * d8 * (float) sumi;
+            if constexpr (has_fusion) {
+                if (xg != nullptr) {
+                    float dscg;
+                    const int sumg = qt_ms32k4_dot_lut(xg + boff, sb, active, u, lut, dscg);
+                    accg[r] += dscg * d8 * (float) sumg;
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < rows_per_group; ++r) {
+#pragma unroll
+        for (int o = lanes_per_row/2; o > 0; o >>= 1) {
+            acc[r] += __shfl_xor_sync(0xFFFFFFFF, acc[r], o, 32);
+            if constexpr (has_fusion) {
+                accg[r] += __shfl_xor_sync(0xFFFFFFFF, accg[r], o, 32);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < rows_per_group; ++r) {
+        const uint32_t row = row0 + r;
+        if (l != r || row >= nrows_x) {
+            continue;
+        }
+        float result = acc[r];
+        if constexpr (has_fusion) {
+            const uint32_t channel_bias = ids ? channel_x : channel_dst;
+            if (fusion.x_bias != nullptr) {
+                result += ((const float *) fusion.x_bias)[sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row];
+            }
+            if (fusion.gate != nullptr) {
+                float gate_value = accg[r];
+                if (fusion.gate_bias != nullptr) {
+                    gate_value += ((const float *) fusion.gate_bias)[sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row];
+                }
+                switch (fusion.glu_op) {
+                    case GGML_GLU_OP_SWIGLU:
+                        result *= ggml_cuda_op_silu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_GEGLU:
+                        result *= ggml_cuda_op_gelu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_OAI:
+                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                        break;
+                    default:
+                        result = result * gate_value;
+                        break;
+                }
+            }
+        }
+        dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row] = result;
+    }
+}
+
+static void mul_mat_vec_qt_ms32k4_lut_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x,
+        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio, const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
+    constexpr int nwarps = 4;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const int  nsub       = ncols_x / QKT_MS32K_SUB;
+    const dim3 block_dims(32, nwarps, 1);
+#define QT_LUT_LAUNCH(FUS, LPR, RPG) do {                                                                    \
+        const int rows_per_block = nwarps * (32 / (LPR)) * (RPG);                                             \
+        const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, nchannels_dst, nsamples_dst);  \
+        mul_mat_vec_qt_ms32k4_lut<FUS, LPR, RPG><<<block_nums, block_dims, 0, stream>>>(                      \
+            vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x, channel_ratio,             \
+            stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x,            \
+            stride_sample_y, stride_sample_dst);                                                              \
+    } while (0)
+    if (nsub <= 8) {
+        if (has_fusion) { QT_LUT_LAUNCH(true,  8, 2); } else { QT_LUT_LAUNCH(false,  8, 2); }
+    } else if (nsub <= 16) {
+        if (has_fusion) { QT_LUT_LAUNCH(true, 16, 2); } else { QT_LUT_LAUNCH(false, 16, 2); }
+    } else {
+        if (has_fusion) { QT_LUT_LAUNCH(true, 32, 2); } else { QT_LUT_LAUNCH(false, 32, 2); }
+    }
+#undef QT_LUT_LAUNCH
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -813,6 +1250,25 @@ static void mul_mat_vec_q_switch_ncols_dst(
     switch (ncols_dst) {
         case 1: {
             constexpr int c_ncols_dst = 1;
+
+            if constexpr (type == GGML_TYPE_QT_MS32K4) {
+                static const bool qt_generic = getenv("GGML_CUDA_QT_GENERIC_MMVQ") != nullptr;   // A/B switch: generic path
+                static const bool qt_nolut   = getenv("GGML_CUDA_QT_NOLUT")        != nullptr;   // A/B switch: v2 rows kernel
+                if (!qt_generic && !qt_nolut) {
+                    mul_mat_vec_qt_ms32k4_lut_launch(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
+                        stride_row_x, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                        nchannels_dst, nsamples_dst, stream);
+                    return;
+                }
+                if (!qt_generic) {
+                    mul_mat_vec_qt_ms32k4_rows_launch(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
+                        stride_row_x, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                        nchannels_dst, nsamples_dst, stream);
+                    return;
+                }
+            }
 
             bool use_small_k = should_use_small_k(c_ncols_dst);
 
@@ -944,6 +1400,12 @@ static void mul_mat_vec_q_switch_type(
             break;
         case GGML_TYPE_Q4_SYM16K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_SYM16K>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_QT_MS32K4:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_QT_MS32K4>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);

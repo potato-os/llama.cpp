@@ -81,6 +81,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q2_SYM32K4:
         case GGML_TYPE_Q1_SYM32K:
         case GGML_TYPE_Q4_SYM16K:
+        case GGML_TYPE_QT_MS32K4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q3_K:
             return MMQ_Q8_1_DS_LAYOUT_D4;
@@ -209,6 +210,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q2_SYM32K4: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q1_SYM32K: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q4_SYM16K: return MMQ_DP4A_TXS_Q8_0_16;
+        case GGML_TYPE_QT_MS32K4: return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q3_K:    return MMQ_DP4A_TXS_Q3_K;
         case GGML_TYPE_Q4_K:    return MMQ_DP4A_TXS_Q4_K;
         case GGML_TYPE_Q5_K:    return MMQ_DP4A_TXS_Q5_K;
@@ -263,6 +265,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q2_SYM32K4: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q1_SYM32K: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q4_SYM16K: return MMQ_MMA_TILE_X_K_Q3_K;
+        case GGML_TYPE_QT_MS32K4: return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q3_K:    return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q4_K:    return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q5_K:    return MMQ_MMA_TILE_X_K_Q8_1;
@@ -1957,6 +1960,83 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
+// QT_MS32K4 uses Q8_0 tiles: signed codes -1/0/+1 and one float scale per 32 values.
+// Even lanes write the shared scale; both halves retain their own code stores. One thread per
+// 16-elem group, 16 threads per row: the running sign start is an exclusive prefix popcount of the
+// row's 16-bit mask words, done as a 16-lane segmented warp scan.
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_qt_ms32k4(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = MMQ_DP4A_TXS_Q8_0;
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int threads_per_row = MMQ_ITER_K / 16;
+    static_assert(threads_per_row == 16, "QT_MS32K4 tile loader assumes 16 threads per 256-elem row");
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_qt_ms32k4 * bxi = (const block_qt_ms32k4 *) x + kbx0 + i*stride;
+
+        const int bits16 = ((const uint16_t *) bxi->mask)[kqsx];      // mask of elems 16*kqsx .. +15
+        const int own    = __popc(bits16);
+        int incl = own;
+#pragma unroll
+        for (int o = 1; o < threads_per_row; o <<= 1) {
+            const int t = __shfl_up_sync(0xFFFFFFFF, incl, o, threads_per_row);
+            if (kqsx >= o) {
+                incl += t;
+            }
+        }
+        const int start = incl - own;
+
+        const uint16_t * s16 = (const uint16_t *) bxi->signs;
+        const int si = start >> 4;
+        uint32_t sw = ((uint32_t) s16[min(si, 7)] | ((uint32_t) s16[min(si + 1, 7)] << 16)) >> (start & 15);
+
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int x_qs_k = qt_ms32k4_lanes((bits16 >> (4*l)) & 0x0F, sw);
+            const int k = 4*kqsx + l;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + k] = x_qs_k;
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k] = x_qs_k;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+
+        const int sb = kqsx / 2;
+        const uint8_t sc = (sb & 1) ? (bxi->scales[sb >> 1] >> 4) : (bxi->scales[sb >> 1] & 0x0F);
+        const float df = __half2float(bxi->d) * (float) sc;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        if ((kqsx & 1) == 0) {
+            x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + sb] = df;
+        }
+#else
+        if ((kqsx & 1) == 0) {
+            x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + sb] = df;
+        }
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
 template <int mmq_x, int mmq_y>
 static __device__ __forceinline__ void vec_dot_q2_K_q8_1_dp4a(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
@@ -3646,6 +3726,14 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q1_SYM32K> {
 };
 
 template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_QT_MS32K4> {
+    static constexpr int              vdr          = VDR_Q8_0_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_qt_ms32k4<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q4_SYM16K> {
     static constexpr int              vdr          = VDR_IQ2_XS_Q8_1_MMQ;
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q4_sym16k<mmq_y, need_check>;
@@ -4479,6 +4567,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_SYM16);
 extern DECL_MMQ_CASE(GGML_TYPE_Q1_SYM32K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_SYM16K);
+extern DECL_MMQ_CASE(GGML_TYPE_QT_MS32K4);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q3_K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_K);

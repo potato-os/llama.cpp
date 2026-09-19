@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "vecdotq.cuh"  // QT_MS32K4 sign-window helper, get_int_b2
 
 #include <cstdint>
 
@@ -221,6 +222,46 @@ static void dequantize_row_q2_sym32k4_cuda(const void * vx, dst_t * y, const int
     const int threads = 256;
     const int64_t blocks = (nsub + threads - 1) / threads;
     dequantize_block_q2_sym32k4<<<blocks, threads, 0, stream>>>(vx, y, nsub);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_qt_ms32k4(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nsub) {
+    const int64_t is = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (is >= nsub) {
+        return;
+    }
+    const int64_t ib = is / QKT_MS32K_SUPER;
+    const int     s  = is % QKT_MS32K_SUPER;
+    const block_qt_ms32k4 * x = (const block_qt_ms32k4 *)vx + ib;
+
+    int start = 0;
+    for (int t = 0; t < s; ++t) {
+        start += __popc(get_int_b2(x->mask, t));
+    }
+    const int m  = get_int_b2(x->mask, s);
+    uint32_t  sw = qt_ms32k4_sign_window(x, start);
+
+    const uint8_t sc = (s & 1) ? (x->scales[s >> 1] >> 4) : (x->scales[s >> 1] & 0x0F);
+    const float ds = __half2float(x->d) * (float) sc;
+
+    dst_t * y = yy + ib*QKT_MS32K + s*QKT_MS32K_SUB;
+    #pragma unroll
+    for (int j = 0; j < QKT_MS32K_SUB; ++j) {
+        float v = 0.0f;
+        if ((m >> j) & 1) {
+            v = (sw & 1) ? -ds : ds;
+            sw >>= 1;
+        }
+        y[j] = ggml_cuda_cast<dst_t>(v);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_qt_ms32k4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int64_t nsub = k / QKT_MS32K_SUB;
+    const int threads = 256;
+    const int64_t blocks = (nsub + threads - 1) / threads;
+    dequantize_block_qt_ms32k4<<<blocks, threads, 0, stream>>>(vx, y, nsub);
 }
 
 template<typename dst_t>
@@ -902,6 +943,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_q1_sym32k_cuda;
         case GGML_TYPE_Q4_SYM16K:
             return dequantize_row_q4_sym16k_cuda;
+        case GGML_TYPE_QT_MS32K4:
+            return dequantize_row_qt_ms32k4_cuda;
         case GGML_TYPE_Q5_0:
             return dequantize_block_cont_cuda<QK5_0, QR5_0, dequantize_q5_0>;
         case GGML_TYPE_Q5_1:
@@ -970,6 +1013,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_q1_sym32k_cuda;
         case GGML_TYPE_Q4_SYM16K:
             return dequantize_row_q4_sym16k_cuda;
+        case GGML_TYPE_QT_MS32K4:
+            return dequantize_row_qt_ms32k4_cuda;
         case GGML_TYPE_Q5_0:
             return dequantize_block_cont_cuda<QK5_0, QR5_0, dequantize_q5_0>;
         case GGML_TYPE_Q5_1:

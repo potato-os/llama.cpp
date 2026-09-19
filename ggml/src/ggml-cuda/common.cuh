@@ -984,6 +984,15 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q4_SYM16K> {
     static constexpr int qi = QI4_SYM16K;
 };
 
+// QT_MS32K4 (ternary mask+sign, 256-elem block of 8 x 32-elem sub-blocks): qi = 8 so that one MMVQ
+// lane handles one sub-block, which lines up with exactly one q8_1 block.
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_QT_MS32K4> {
+    static constexpr int qk = QKT_MS32K;
+    static constexpr int qr = 8;
+    static constexpr int qi = QKT_MS32K / (4 * 8);
+};
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q5_0> {
     static constexpr int qk = QK5_0;
