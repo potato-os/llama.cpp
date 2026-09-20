@@ -40,7 +40,7 @@ jobs:
           # 12.8: driver >= 570, Turing .. Blackwell
           - cuda: '12.8.2'
             label: '12.8'
-            archs: '75-real;80-real;86-real;89-real;120-real'
+            archs: '75-real;80-real;86-real;89-real;120-real;90-virtual'
             defines: '-DGGML_CUDA_CUB_3DOT2=ON'
 
     steps:
@@ -148,11 +148,11 @@ jobs:
         include:
           # 12.4: widest driver support (>= 551), Turing .. Ada
           - cuda: '12.4'
-            archs: '75-real;80-real;86-real;89-real'
+            archs: '75-real;80-real;86-real;89-real;90-virtual'
             defines: '-DGGML_CUDA_CUB_3DOT2=ON'
           # 13.4: driver >= 580, adds Blackwell (RTX 50xx / RTX PRO 6000)
           - cuda: '13.4'
-            archs: '75-real;80-real;86-real;89-real;120-real'
+            archs: '75-real;80-real;86-real;89-real;120-real;90-virtual'
             defines: ''
 
     steps:
@@ -292,8 +292,9 @@ jobs:
             '24gb' = @('IQ4_XS\Potato-CODER-24GB-IQ4_XS.gguf', 'mmproj-Potato-CODER-24GB-Q8_0.gguf')
             '48gb' = @('IQ4_XS\Potato-CODER-48GB-IQ4_XS-00001-of-00002.gguf', 'IQ4_XS\Potato-CODER-48GB-IQ4_XS-00002-of-00002.gguf',
                        'MTP\mtp-Potato-CODER-48GB-shared-Q3_K_M.gguf', 'mmproj-Potato-CODER-48GB-Q8_0.gguf')
+            '12gb' = @('Potato-CODER-12GB-UD-IQ3_XXS.gguf', 'mmproj-Potato-CODER-12GB-Q8_0.gguf')
           }
-          foreach ($m in @('24gb', '48gb')) {
+          foreach ($m in @('12gb', '24gb', '48gb')) {
             $src = "potato\windows\serve-potato-$m.bat"
             # a: folder name with spaces and parentheses, like "Downloads (1)"
             $a = "$env:RUNNER_TEMP\bat $m (a)"; New-Item -ItemType Directory -Force $a | Out-Null
