@@ -1148,7 +1148,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
-    if (has_ids && ncols_dst > 1) {
+    // D1 experiment (Maple/TQ2_0): at batch 1 the generic path maps only qi=8 threads per 256-element K block,
+    // so at K=2048 half the block idles and at K=512 seven eighths do. The MoE kernel maps K with threadIdx.x.
+    if (has_ids && (ncols_dst > 1 || type == GGML_TYPE_TQ2_0)) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
