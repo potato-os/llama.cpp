@@ -118,7 +118,7 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --draft \
             --prerelease \
-            --notes "Linux x64 CUDA 12.8 runtime for Potato-CODER-12GB-Fast (Millie QT_MS32K4). NVIDIA driver 570 or newer. Extract both archives into the same directory. CI compiles the CUDA backend and checks ternary CPU operations and a server request; hosted runners do not run a GPU inference test."
+            --notes "Linux x64 CUDA 12.8 runtime for Potato-CODER-12GB-Fast (Millie QT_MS32K4). Built on Ubuntu 22.04 (glibc 2.35); NVIDIA driver 570 or newer. Extract both archives into the same directory. CI compiles the CUDA backend and checks ternary CPU operations and a server request; hosted runners do not run a GPU inference test."
           for file in SHA256SUMS.txt ./*.tar.gz; do
             for attempt in 1 2 3 4; do
               if timeout 900 gh release upload "$GITHUB_REF_NAME" "$file" --clobber --repo "$GITHUB_REPOSITORY"; then
