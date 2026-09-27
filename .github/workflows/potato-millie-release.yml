@@ -54,8 +54,8 @@ jobs:
           grep -q -- '--chat-template-file' /tmp/help.txt
           grep -q -- '--reasoning-budget' /tmp/help.txt
           build/bin/test-millie-validation
-          build/bin/test-backend-ops test -b CPU -p QT_MS32K4 -o MUL_MAT,MUL_MAT_ID > /tmp/ternary-test.txt 2>&1
-          grep -q QT_MS32K4 /tmp/ternary-test.txt
+          build/bin/test-backend-ops test -b CPU -p qt_ms32k4 -o MUL_MAT,MUL_MAT_ID > /tmp/ternary-test.txt 2>&1
+          grep -q qt_ms32k4 /tmp/ternary-test.txt
           curl -fsSL -o /tmp/tiny.gguf https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
           build/bin/llama-completion -m /tmp/tiny.gguf -p 'One day, Lily' -n 32 -c 256 -no-cnv --seed 1 > /tmp/gen.txt
           test "$(wc -c < /tmp/gen.txt)" -gt 40
