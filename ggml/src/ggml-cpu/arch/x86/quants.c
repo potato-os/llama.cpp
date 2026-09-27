@@ -4030,7 +4030,11 @@ void ggml_vec_dot_qt_ms32k4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
                 sw = (uint32_t) ((s64[0] >> start) | (s64[1] << (64 - start)));
             }
             const uint32_t sx = _pdep_u32(sw, m); // sign bit at each non-zero position
+#if defined(_MSC_VER)
+            start += (uint32_t) __popcnt(m);
+#else
             start += (uint32_t) __builtin_popcount(m);
+#endif
 
             const __m256i qy = _mm256_loadu_si256((const __m256i *) yb[sb].qs);
             // mz = 0xFF where the weight is zero; sg = 0xFF where negative

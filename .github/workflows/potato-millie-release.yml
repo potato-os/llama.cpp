@@ -93,9 +93,148 @@ jobs:
             SHA256SUMS.txt
           if-no-files-found: error
 
+  windows-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 340
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA 12.4
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_NCCL=OFF ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-virtual" ^
+            -DLLAMA_BUILD_TESTS=ON ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON
+          if errorlevel 1 exit /b 1
+          cmake --build build --config Release --target llama-server llama-completion test-millie-validation test-backend-ops -j 4
+
+      - name: Collect CUDA runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force .\cudart | Out-Null
+          foreach ($src in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib")) {
+            if (Test-Path $src) {
+              Get-ChildItem $src -Include cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll -File -Recurse -Depth 0 -ErrorAction SilentlyContinue |
+                Copy-Item -Destination .\cudart -Force
+            }
+          }
+          if (-not (Test-Path .\build\bin\Release\ggml-cuda.dll)) { throw 'ggml-cuda.dll missing' }
+          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            if (-not (Get-ChildItem .\cudart -Filter $pattern)) { throw "$pattern missing" }
+          }
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location .\build\bin\Release
+          .\llama-server.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'llama-server --version failed' }
+          $help = (& .\llama-server.exe --help 2>&1 | Out-String)
+          foreach ($flag in @('--chat-template-file', '--reasoning-budget', '--alias', '--mmproj')) {
+            if ($help -notmatch [regex]::Escape($flag)) { throw "$flag missing" }
+          }
+          .\test-millie-validation.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Millie validation failed' }
+          .\test-backend-ops.exe test -b CPU -p qt_ms32k4 -o MUL_MAT,MUL_MAT_ID
+          if ($LASTEXITCODE -ne 0) { throw 'ternary backend operations failed' }
+          $model = Join-Path $env:RUNNER_TEMP 'tiny.gguf'
+          Invoke-WebRequest 'https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf' -OutFile $model
+          $gen = (& .\llama-completion.exe -m $model -p 'One day, Lily' -n 32 -c 256 -no-cnv --seed 1 2>$null | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw 'llama-completion failed' }
+          if ($gen.Length -lt 40) { throw 'generation too short' }
+          $server = Start-Process .\llama-server.exe -ArgumentList @('-m', "`"$model`"", '-c', '256', '-np', '1', '--host', '127.0.0.1', '--port', '8099', '--no-webui', '--jinja', '--alias', 'potato-coder-12gb-fast') -PassThru -RedirectStandardOutput "$env:RUNNER_TEMP\server.out" -RedirectStandardError "$env:RUNNER_TEMP\server.err"
+          try {
+            $ready = $false
+            foreach ($i in 1..60) {
+              try { Invoke-RestMethod http://127.0.0.1:8099/health | Out-Null; $ready = $true; break } catch { Start-Sleep 1 }
+            }
+            if (-not $ready) { Get-Content "$env:RUNNER_TEMP\server.err"; throw 'server did not become healthy' }
+            $response = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8099/completion -ContentType 'application/json' -Body '{"prompt":"One day","n_predict":16}'
+            if (-not $response.content) { throw 'empty completion' }
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Launcher smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'Fast model (test)'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item potato\windows\serve-potato-fast.bat "$dir\serve-potato.bat"
+          $inputFile = Join-Path $env:RUNNER_TEMP 'empty-input.txt'
+          Set-Content $inputFile ''
+          function Run-Launcher([bool]$mayRun = $false) {
+            $p = Start-Process cmd.exe -ArgumentList '/c', "`"$dir\serve-potato.bat`"" -PassThru -RedirectStandardInput $inputFile -RedirectStandardOutput "$dir.out" -RedirectStandardError "$dir.err"
+            if (-not $p.WaitForExit(10000)) {
+              if (-not $mayRun) { Stop-Process -Id $p.Id -Force; throw 'launcher hung' }
+              Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            }
+            return (Get-Content "$dir.out" -Raw) + (Get-Content "$dir.err" -Raw)
+          }
+          $output = Run-Launcher
+          if ($output -notmatch 'llama-server.exe not found') { throw 'missing runtime error unclear' }
+          Copy-Item .\build\bin\Release\* $dir -Recurse
+          $output = Run-Launcher
+          if ($output -notmatch 'file not found:.*Potato-CODER-12GB-Fast-Ternary.gguf') { throw 'missing model error unclear' }
+          foreach ($file in @('Potato-CODER-12GB-Fast-Ternary.gguf', 'mmproj-Potato-CODER-12GB-Fast-Q8_0.gguf')) {
+            Copy-Item "$env:RUNNER_TEMP\tiny.gguf" "$dir\$file"
+          }
+          Set-Content "$dir\chat-template-sharp-potato.jinja" '{{ messages }}'
+          $output = Run-Launcher $true
+          if ($output -notmatch 'Starting Potato-CODER-12GB-Fast') { throw 'launcher did not start server' }
+          if ($output -match 'error: invalid argument') { throw 'launcher passed an unsupported flag' }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = 'llama-potato-millie-win-cuda-12.4-x64'
+          Copy-Item LICENSE .\build\bin\Release\LICENSE-llama.cpp
+          Copy-Item potato\windows\serve-potato-fast.bat .\build\bin\Release\serve-potato.bat
+          git rev-parse HEAD | Out-File -Encoding ascii .\build\bin\Release\POTATO-COMMIT.txt
+          7z a "$name.zip" .\build\bin\Release\*
+          if ($LASTEXITCODE -ne 0) { throw 'runtime archive failed' }
+          7z a "cudart-$name.zip" .\cudart\*
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA runtime archive failed' }
+          $lines = @("$name.zip", "cudart-$name.zip") | ForEach-Object {
+            (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower() + "  $_"
+          }
+          [System.IO.File]::WriteAllText('SHA256SUMS-windows.txt', ($lines -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: potato-millie-win-cuda-12.4-x64
+          path: |
+            llama-potato-millie-win-cuda-12.4-x64.zip
+            cudart-llama-potato-millie-win-cuda-12.4-x64.zip
+            SHA256SUMS-windows.txt
+          if-no-files-found: error
+
   release:
     if: startsWith(github.ref, 'refs/tags/potato-millie-v')
-    needs: linux-cuda
+    needs: [linux-cuda, windows-cuda]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -105,12 +244,19 @@ jobs:
           name: potato-millie-linux-cuda-12.8-x64
           path: dist
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: potato-millie-win-cuda-12.4-x64
+          path: dist
+
       - name: Publish tested archives
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cd dist
+          cat SHA256SUMS-windows.txt >> SHA256SUMS.txt
+          rm SHA256SUMS-windows.txt
           sha256sum -c SHA256SUMS.txt
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
@@ -118,8 +264,8 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --draft \
             --prerelease \
-            --notes "Linux x64 CUDA 12.8 runtime for Potato-CODER-12GB-Fast (Millie QT_MS32K4). Built on Ubuntu 22.04 (glibc 2.35); NVIDIA driver 570 or newer. Extract both archives into the same directory. CI compiles the CUDA backend and checks ternary CPU operations and a server request; hosted runners do not run a GPU inference test."
-          for file in SHA256SUMS.txt ./*.tar.gz; do
+            --notes "Linux x64 CUDA 12.8 and Windows x64 CUDA 12.4 runtimes for Potato-CODER-12GB-Fast (Millie QT_MS32K4). Extract the matching llama and cudart archives into one directory. Windows CUDA 12.4 requires NVIDIA driver 551 or newer (Turing through Ada); Linux CUDA 12.8 requires driver 570 or newer. CI compiles the CUDA backend, checks ternary CPU operations, and serves a test request. Hosted runners have no GPU, so GPU inference is not validated by CI."
+          for file in SHA256SUMS.txt ./*.tar.gz ./*.zip; do
             for attempt in 1 2 3 4; do
               if timeout 900 gh release upload "$GITHUB_REF_NAME" "$file" --clobber --repo "$GITHUB_REPOSITORY"; then
                 break
