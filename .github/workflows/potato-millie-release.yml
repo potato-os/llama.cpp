@@ -148,15 +148,19 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Set-Location .\build\bin\Release
           .\llama-server.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'llama-server --version failed' }
           $help = (& .\llama-server.exe --help 2>&1 | Out-String)
           foreach ($flag in @('--chat-template-file', '--reasoning-budget', '--alias', '--mmproj')) {
             if ($help -notmatch [regex]::Escape($flag)) { throw "$flag missing" }
           }
           .\test-millie-validation.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Millie validation failed' }
           .\test-backend-ops.exe test -b CPU -p qt_ms32k4 -o MUL_MAT,MUL_MAT_ID
+          if ($LASTEXITCODE -ne 0) { throw 'ternary backend operations failed' }
           $model = Join-Path $env:RUNNER_TEMP 'tiny.gguf'
           Invoke-WebRequest 'https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf' -OutFile $model
           $gen = (& .\llama-completion.exe -m $model -p 'One day, Lily' -n 32 -c 256 -no-cnv --seed 1 2>$null | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw 'llama-completion failed' }
           if ($gen.Length -lt 40) { throw 'generation too short' }
           $server = Start-Process .\llama-server.exe -ArgumentList @('-m', "`"$model`"", '-c', '256', '-np', '1', '--host', '127.0.0.1', '--port', '8099', '--no-webui', '--jinja', '--alias', 'potato-coder-12gb-fast') -PassThru -RedirectStandardOutput "$env:RUNNER_TEMP\server.out" -RedirectStandardError "$env:RUNNER_TEMP\server.err"
           try {
