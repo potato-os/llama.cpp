@@ -218,9 +218,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'runtime archive failed' }
           7z a "cudart-$name.zip" .\cudart\*
           if ($LASTEXITCODE -ne 0) { throw 'CUDA runtime archive failed' }
-          @("$name.zip", "cudart-$name.zip") | ForEach-Object {
+          $lines = @("$name.zip", "cudart-$name.zip") | ForEach-Object {
             (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower() + "  $_"
-          } | Out-File -Encoding ascii SHA256SUMS-windows.txt
+          }
+          [System.IO.File]::WriteAllText('SHA256SUMS-windows.txt', ($lines -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
 
       - uses: actions/upload-artifact@v4
         with:
