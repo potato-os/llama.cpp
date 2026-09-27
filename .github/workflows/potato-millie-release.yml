@@ -1,0 +1,131 @@
+name: Potato Millie CUDA release
+
+on:
+  push:
+    branches: [potato-millie-cuda]
+    tags: ['potato-millie-v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: potato-millie-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-cuda:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.2-devel-ubuntu24.04
+    timeout-minutes: 340
+
+    steps:
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build libssl-dev curl jq
+
+      - uses: actions/checkout@v4
+
+      - name: Configure and build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            -DGGML_CUDA_CUB_3DOT2=ON \
+            -DCMAKE_CUDA_ARCHITECTURES='75-real;80-real;86-real;89-real;120-real;90-virtual' \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --target llama-server llama-completion test-millie-validation test-backend-ops -j 4
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build/bin/libggml-cuda.so
+          build/bin/llama-server --version
+          build/bin/llama-server --help > /tmp/help.txt 2>&1 || true
+          grep -q -- '--chat-template-file' /tmp/help.txt
+          grep -q -- '--reasoning-budget' /tmp/help.txt
+          build/bin/test-millie-validation
+          build/bin/test-backend-ops test -b CPU -p QT_MS32K4 -o MUL_MAT,MUL_MAT_ID > /tmp/ternary-test.txt 2>&1
+          grep -q QT_MS32K4 /tmp/ternary-test.txt
+          curl -fsSL -o /tmp/tiny.gguf https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+          build/bin/llama-completion -m /tmp/tiny.gguf -p 'One day, Lily' -n 32 -c 256 -no-cnv --seed 1 > /tmp/gen.txt
+          test "$(wc -c < /tmp/gen.txt)" -gt 40
+          build/bin/llama-server -m /tmp/tiny.gguf -c 256 --port 8099 --no-webui --jinja > /tmp/server.log 2>&1 &
+          srv=$!
+          trap 'kill "$srv" 2>/dev/null || true' EXIT
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8099/health > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          test "$ok" = 1 || { cat /tmp/server.log; exit 1; }
+          curl -fsS http://127.0.0.1:8099/completion -d '{"prompt":"One day","n_predict":16}' | jq -e '.content | length > 0'
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=llama-potato-millie-linux-cuda-12.8-x64
+          cp LICENSE build/bin/LICENSE-llama.cpp
+          git rev-parse HEAD > build/bin/POTATO-COMMIT.txt
+          tar -czf "$name.tar.gz" --transform "s,^\.,$name," -C build/bin .
+          mkdir cudart
+          cp -P /usr/local/cuda/lib64/libcudart.so.* /usr/local/cuda/lib64/libcublas.so.* /usr/local/cuda/lib64/libcublasLt.so.* cudart/
+          tar -czf "cudart-$name.tar.gz" --transform "s,^\.,$name," -C cudart .
+          sha256sum "$name.tar.gz" "cudart-$name.tar.gz" > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: potato-millie-linux-cuda-12.8-x64
+          path: |
+            llama-potato-millie-linux-cuda-12.8-x64.tar.gz
+            cudart-llama-potato-millie-linux-cuda-12.8-x64.tar.gz
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/potato-millie-v')
+    needs: linux-cuda
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: potato-millie-linux-cuda-12.8-x64
+          path: dist
+
+      - name: Publish tested archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --draft \
+            --prerelease \
+            --notes "Linux x64 CUDA 12.8 runtime for Potato-CODER-12GB-Fast (Millie QT_MS32K4). NVIDIA driver 570 or newer. Extract both archives into the same directory. CI compiles the CUDA backend and checks ternary CPU operations and a server request; hosted runners do not run a GPU inference test."
+          for file in SHA256SUMS.txt ./*.tar.gz; do
+            for attempt in 1 2 3 4; do
+              if timeout 900 gh release upload "$GITHUB_REF_NAME" "$file" --clobber --repo "$GITHUB_REPOSITORY"; then
+                break
+              fi
+              if [ "$attempt" = 4 ]; then exit 1; fi
+              sleep 30
+            done
+          done
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
