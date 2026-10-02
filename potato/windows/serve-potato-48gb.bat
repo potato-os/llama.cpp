@@ -41,7 +41,7 @@ setlocal DisableDelayedExpansion
 
 echo Starting Potato-CODER-48GB on http://127.0.0.1:8080 ... keep this window open.
 "%LLAMA%" -m "%MODELS%\IQ4_XS\Potato-CODER-48GB-IQ4_XS-00001-of-00002.gguf" ^
-  -c 229376 -ngl 99 -ts 1.1,1 -ub 512 -b 4096 -fa on -ctk f16 -ctv f16 ^
+  -c 212992 -ngl 99 -ts 1.1,1 -ub 512 -b 4096 -fa on -ctk f16 -ctv f16 ^
   --mmproj "%MODELS%\mmproj-Potato-CODER-48GB-Q8_0.gguf" --no-mmproj-offload --mmproj-swap-draft --image-max-tokens 2048 ^
   --spec-type draft-mtp -md "%MODELS%\MTP\mtp-Potato-CODER-48GB-shared-Q3_K_M.gguf" --spec-draft-n-max 2 -devd CUDA1 ^
   --jinja --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
