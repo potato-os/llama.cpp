@@ -979,3 +979,25 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     }
 }
+
+bool llama_memory_hybrid_idx::gpu_suspend() {
+    if (!llama_memory_hybrid::gpu_suspend()) {
+        return false;
+    }
+    if (mem_idx && !mem_idx->gpu_suspend()) {
+        // roll back so that nothing changed
+        if (!llama_memory_hybrid::gpu_resume()) {
+            GGML_ABORT("%s: failed to roll back the attention cache after the indexer cache refused to suspend", __func__);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool llama_memory_hybrid_idx::gpu_resume() {
+    // both are idempotent, so a failed resume can be retried as a whole
+    if (!llama_memory_hybrid::gpu_resume()) {
+        return false;
+    }
+    return !mem_idx || mem_idx->gpu_resume();
+}

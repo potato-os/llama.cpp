@@ -289,3 +289,30 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
 }
+
+static bool llama_memory_recr_on_device(const llama_memory_recurrent * mem) {
+    if (!mem) {
+        return false;
+    }
+    for (const auto & [buft, size] : mem->memory_breakdown()) {
+        if (size > 0 && !ggml_backend_buft_is_host(buft)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_memory_hybrid::gpu_suspend() {
+    if (llama_memory_recr_on_device(mem_recr.get())) {
+        return false; // recurrent state on the device: not supported
+    }
+    return mem_attn->gpu_suspend();
+}
+
+bool llama_memory_hybrid::gpu_resume() {
+    return mem_attn->gpu_resume();
+}
+
+bool llama_memory_hybrid::gpu_suspended() const {
+    return mem_attn->gpu_suspended();
+}

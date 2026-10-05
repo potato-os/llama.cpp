@@ -155,6 +155,8 @@ public:
     // [EXPERIMENTAL] device memory suspend/resume
 
     bool gpu_suspend() override;
+    // whether buf is one of this cache's own buffers (not a layer shared from another cache)
+    bool owns_buffer(ggml_backend_buffer_t buf) const;
     bool gpu_resume() override;
     bool gpu_suspended() const override { return suspended; }
 

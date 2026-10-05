@@ -406,13 +406,23 @@ static bool llama_kv_tensor_on_device(const ggml_tensor * t) {
     return t && t->buffer && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(t->buffer));
 }
 
+bool llama_kv_cache::owns_buffer(const ggml_backend_buffer_t buf) const {
+    for (const auto & [ctx, b] : ctxs_bufs) {
+        if (b.get() == buf) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool llama_kv_cache::gpu_suspend() {
     if (suspended) {
         return true;
     }
 
-    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
-    if (other || hparams.no_alloc) {
+    // a cache that shares the cells of another one (an MTP draft against its target, the qwen4exp indexer) can still release
+    // its own tensors: only tensors in this cache's buffers are saved and freed, the shared cells stay with their owner
+    if (hparams.no_alloc) {
         return false;
     }
 
@@ -445,6 +455,8 @@ bool llama_kv_cache::gpu_suspend() {
         return false;
     }
 
+    const auto own_on_device = [this](const ggml_tensor * t) { return llama_kv_tensor_on_device(t) && owns_buffer(t->buffer); };
+
     std::vector<uint32_t> rows(n_stream);
     size_t n_bytes = 0;
 
@@ -453,7 +465,7 @@ bool llama_kv_cache::gpu_suspend() {
 
         for (const auto & layer : layers) {
             for (const ggml_tensor * t : { layer.k, layer.v }) {
-                if (llama_kv_tensor_on_device(t)) {
+                if (own_on_device(t)) {
                     n_bytes += (size_t) rows[s]*t->nb[1];
                 }
             }
@@ -477,7 +489,7 @@ bool llama_kv_cache::gpu_suspend() {
 
         for (const auto & layer : layers) {
             for (ggml_tensor * t : { layer.k, layer.v }) {
-                if (!llama_kv_tensor_on_device(t)) {
+                if (!own_on_device(t)) {
                     continue;
                 }
 
@@ -551,6 +563,8 @@ bool llama_kv_cache::gpu_resume() {
         n_alloc += sb.size;
     }
 
+    const auto own_on_device = [this](const ggml_tensor * t) { return llama_kv_tensor_on_device(t) && owns_buffer(t->buffer); };
+
     size_t off = 0;
     for (uint32_t s = 0; s < n_stream; ++s) {
         if (susp_rows[s] == 0) {
@@ -559,7 +573,7 @@ bool llama_kv_cache::gpu_resume() {
 
         for (const auto & layer : layers) {
             for (ggml_tensor * t : { layer.k, layer.v }) {
-                if (!llama_kv_tensor_on_device(t)) {
+                if (!own_on_device(t)) {
                     continue;
                 }
 

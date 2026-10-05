@@ -71,6 +71,12 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // [gpu suspend] the attention cache releases its device buffers; a recurrent part is only allowed when it holds no
+    // device memory (an MTP draft has no recurrent layer)
+    bool gpu_suspend() override;
+    bool gpu_resume() override;
+    bool gpu_suspended() const override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
