@@ -2721,19 +2721,31 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
 
+                        // the indexer cache only for the layers that run QSA (compress ratio > 0): a checkpoint with QSA
+                        // off (all ratios 0, e.g. Potato's LH) or a dense MTP layer would otherwise keep a cache that no op
+                        // reads, and with a k-pool the per-ubatch pool bookkeeping grows with the context
+                        const bool is_mtp = arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+                        const auto qsa_layer = [&](uint32_t il) {
+                            return il < hparams.dsv4_compress_ratios.size() && hparams.dsv4_compress_ratios[il] > 0;
+                        };
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-                            // QSA runs on the dense-attention layers only
-                            filter_idx = [&](uint32_t il) {
-                                return il < hparams.n_layer() && !hparams.is_recr(il);
-                            };
+                            bool any_qsa = false;
+                            for (uint32_t il = is_mtp ? hparams.n_layer() : 0; il < (is_mtp ? hparams.n_layer() + hparams.n_layer_nextn : hparams.n_layer()); ++il) {
+                                any_qsa = any_qsa || (qsa_layer(il) && (is_mtp || !hparams.is_recr(il)));
+                            }
+                            if (any_qsa) {
+                                filter_idx = [&, qsa_layer](uint32_t il) {
+                                    return il < hparams.n_layer() && !hparams.is_recr(il) && qsa_layer(il);
+                                };
+                            }
                         }
 
                         // the MTP draft context holds the MTP block alone: its attention and indexer, no recurrent layer
-                        if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                        if (is_mtp) {
                             filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
                             filter_recr = [&](uint32_t)    { return false; };
                             if (filter_idx) {
-                                filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                                filter_idx = [&, qsa_layer](uint32_t il) { return il >= hparams.n_layer() && qsa_layer(il); };
                             }
                         }
                     }
