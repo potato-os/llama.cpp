@@ -1,12 +1,13 @@
 # llama.cpp for Potato-CODER
 
-This branch (`potato-main`) is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) `master` plus two changes that the
+This branch (`potato-main`) is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) `master` plus the changes the
 Potato-CODER models need. Everything else is stock llama.cpp, see [README.md](README.md).
 
 | change | what it does | needed by |
 |---|---|---|
-| qwen4exp NextN/MTP draft head | loads the `mtp-*.gguf` draft head of Qwen3.8-Flash-Next models (`--spec-type draft-mtp -md <head>`); squash of upstream PR #28243 by Daniel Han | Potato-CODER-48GB |
+| qwen4exp MTP draft head | upstream native qwen4exp MTP (#29761) + Potato patches: loads the shared `mtp-*.gguf` draft heads of Qwen3.8-Flash-Next models (`--spec-type draft-mtp -md <head>`) | Potato-CODER-48GB |
 | `--mmproj-swap-draft` | keeps the vision projector off the GPU and, when an image arrives, encodes it on a temporary GPU projector while the MTP draft context releases its VRAM; falls back to the CPU projector when VRAM is still short | both, when the cards are full |
+| CUDA MMQ tail repair | guards the tail loads and sizes the padding of CUDA quantized matmuls on partial tiles | all CUDA builds |
 
 The build also compiles the `q8_0`/`q5_0` flash-attention kernel pair that Potato-CODER-24GB serves with.
 
@@ -17,9 +18,10 @@ Prebuilt zips are on the [releases page](../../releases):
 | file | for |
 |---|---|
 | `llama-potato-bin-linux-cuda-12.8-x64.tar.gz` | Linux x64, NVIDIA driver 570+, RTX 20xx to 50xx |
+| `llama-potato-bin-linux-cuda-13.0-arm64.tar.gz` | Linux arm64, NVIDIA DGX Spark (GB10), driver 580+ |
 | `llama-potato-bin-win-cuda-12.4-x64.zip` | Windows x64, NVIDIA driver 551+, RTX 20xx to 40xx |
 | `llama-potato-bin-win-cuda-13.4-x64.zip` | Windows x64, NVIDIA driver 580+, adds RTX 50xx |
-| `cudart-llama-potato-bin-<same name>` | the NVIDIA CUDA runtime libraries for that build; unpack into the same folder. Needed on Windows, on Linux only when no CUDA 12 runtime is installed |
+| `cudart-llama-potato-bin-<same name>` | the NVIDIA CUDA runtime libraries for that build; unpack into the same folder. Needed on Windows, on Linux only when no matching CUDA runtime is installed |
 
 If a `cudart-` archive is missing from a release, the `cudart-llama-bin-...` archive of the same CUDA version from the
 [upstream releases](https://github.com/ggml-org/llama.cpp/releases) contains the same libraries.
@@ -54,7 +56,7 @@ llama-server -m Potato-CODER-48GB-IQ4_XS-00001-of-00002.gguf \
   --jinja --chat-template-kwargs '{"preserve_thinking": false}' \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
   --mmproj mmproj-Potato-CODER-48GB-Q8_0.gguf --no-mmproj-offload --mmproj-swap-draft --image-max-tokens 2048 \
-  --spec-type draft-mtp --spec-draft-n-max 2 -md mtp-Potato-CODER-48GB-shared-Q3_K_M.gguf -devd CUDA1
+  --spec-type draft-mtp --spec-draft-n-max 3 -md mtp-Potato-CODER-48GB-shared-Q3_K_M.gguf -devd CUDA1
 ```
 
 Potato-CODER-24GB, one 24 GB card, 262k context, vision and MTP:
