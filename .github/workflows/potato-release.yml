@@ -162,7 +162,7 @@ jobs:
           # 13.4: driver >= 580, adds Blackwell (RTX 50xx / RTX PRO 6000)
           - cuda: '13.4'
             archs: '75-real;80-real;86-real;89-real;120-real;90-virtual'
-            defines: ''
+            defines: '-DGGML_CUDA_CCCL_VERSION=v3.4.3'
 
     steps:
       - name: Clone
