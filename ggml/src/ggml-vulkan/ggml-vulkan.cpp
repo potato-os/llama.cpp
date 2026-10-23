@@ -1331,6 +1331,97 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
     return result;
 }
 
+// Wide coopmat1 FA: Br = 16 * subgroups, each subgroup owns 16 query rows; see flash_attn_cm1w.comp.
+static constexpr uint32_t FA_WIDE_NUM_SUBGROUPS = 4;
+static constexpr uint32_t FA_WIDE_BC = 32;
+static constexpr uint32_t FA_WIDE_MIN_ROWS = 64;
+
+static vk_fa_tuning_params get_fa_tuning_params_coopmat1_wide(const vk_device& device) {
+    vk_fa_tuning_params result{};
+    result.path = FA_COOPMAT1_WIDE;
+    result.block_rows = 16 * FA_WIDE_NUM_SUBGROUPS;
+    result.block_cols = FA_WIDE_BC;
+    result.row_split = FA_WIDE_NUM_SUBGROUPS;
+    result.subgroup_size = device->subgroup_size;
+    result.workgroup_size = FA_WIDE_NUM_SUBGROUPS * device->subgroup_size;
+    result.d_split = 1;
+    result.shmem_staging = 0;
+    return result;
+}
+
+static bool ggml_vk_flash_attn_coopmat_wide_shmem_support(const vk_device& device, uint32_t hsk, uint32_t hsv) {
+    // Needs to be kept up to date with flash_attn_cm1w.comp
+    const uint32_t Br = 16 * FA_WIDE_NUM_SUBGROUPS;
+    const uint32_t Bc = FA_WIDE_BC;
+    const uint32_t qsh   = Br * (hsk / 4 + 2) * 8;
+    const uint32_t ksh   = Bc * (hsk / 4 + 2) * 8;
+    const uint32_t vsh   = hsv * (Bc / 4 + 2) * 8;
+    const uint32_t ssh   = FA_WIDE_NUM_SUBGROUPS * 16 * (Bc / 4 + 1) * 16;
+    const uint32_t rowsh = FA_WIDE_NUM_SUBGROUPS * 16 * sizeof(float);
+    const uint32_t idxsh = 256 * sizeof(float);
+    // DATA_A_IQ4_NL is compiled into the FA shaders unconditionally, so its shared table is always allocated.
+    const uint32_t iq_shmem = 16 * sizeof(ggml_fp16_t);
+    const uint32_t total_size = qsh + std::max(ksh, vsh) + ssh + rowsh + idxsh + iq_shmem;
+    return total_size <= device->properties.limits.maxComputeSharedMemorySize;
+}
+
+static bool ggml_vk_fa_wide_type_supported(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Whether the wide coopmat1 kernel can run this FLASH_ATTN_EXT. It reads K/V in their
+// cache type (quants are dequantized while staging), so no f16 scratch copy is needed.
+static bool ggml_vk_fa_wide_candidate(const vk_device& device, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, bool f32acc) {
+    static const char * env = getenv("GGML_VK_FA_WIDE");
+    if (env != nullptr && strcmp(env, "0") == 0) {
+        return false;
+    }
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    const bool forced = env != nullptr && strcmp(env, "1") == 0;
+    // Tuned and validated on RDNA3 (RADV, wave64); other devices keep the existing paths unless forced.
+    const bool device_ok = forced || (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == vk_device_architecture::AMD_RDNA3);
+    if (!device_ok || device->coopmat2 || !device->coopmat1_fa_support || !device->coopmat_support_16x16x16_f32acc || !f32acc) {
+        return false;
+    }
+    if (device->subgroup_size != 16 && device->subgroup_size != 32 && device->subgroup_size != 64) {
+        return false;
+    }
+    const uint32_t hsk = (uint32_t) k->ne[0];
+    const uint32_t hsv = (uint32_t) v->ne[0];
+    if (q->ne[1] < FA_WIDE_MIN_ROWS || (hsk % 16) != 0 || (hsv % (16 * FA_WIDE_NUM_SUBGROUPS)) != 0 || q->ne[0] != k->ne[0]) {
+        return false;
+    }
+    if (!ggml_vk_fa_wide_type_supported(k->type) || !ggml_vk_fa_wide_type_supported(v->type)) {
+        return false;
+    }
+    // vec4 loads of Q, f16vec4 loads of f16 K/V
+    if (((q->nb[1] | q->nb[2] | q->nb[3]) % 16) != 0) {
+        return false;
+    }
+    if (k->type == GGML_TYPE_F16 && ((k->nb[1] | k->nb[2] | k->nb[3]) % 8) != 0) {
+        return false;
+    }
+    if (v->type == GGML_TYPE_F16 && ((v->nb[1] | v->nb[2] | v->nb[3]) % 8) != 0) {
+        return false;
+    }
+    return ggml_vk_flash_attn_coopmat_wide_shmem_support(device, hsk, hsv);
+#else
+    GGML_UNUSED(device); GGML_UNUSED(q); GGML_UNUSED(k); GGML_UNUSED(v); GGML_UNUSED(f32acc);
+    return false;
+#endif
+}
+
 vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
@@ -2110,6 +2201,22 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     !fa_ds, !fa_ds ? fa_sgs : 0);
+        }
+    }
+#endif
+
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    if (device->coopmat1_fa_support) {
+        for (auto &fa : device->pipeline_flash_attn_f32_f16) {
+            if (fa.first.path != FA_COOPMAT1_WIDE) continue;
+            const uint32_t Br = fa.first.Br;
+            const uint32_t Bc = fa.first.Bc;
+            const bool aligned = fa.first.aligned;
+            ggml_vk_create_pipeline(device, fa.second, aligned ? "flash_attn_f32_f16_aligned_cm1w" : "flash_attn_f32_f16_cm1w",
+                                    flash_attn_f32_f16_w_cm1_len, flash_attn_f32_f16_w_cm1_data, "main", 8,
+                                    sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
+                                    get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
+                                    true, fa.first.subgroup_size);
         }
     }
 #endif
@@ -8149,7 +8256,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                  v->nb[1] != (uint64_t)HSV * ggml_type_size(v->type)) &&
                                 (HSK % 8) == 0 && (HSV % 8) == 0;
     const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
-    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
+    // The wide coopmat1 kernel reads K/V in place (dequantizing quants while staging), so it needs no
+    // f16 scratch (which would cost 2 x KV x HS x heads x 2 bytes of VRAM at long context).
+    const bool wide_candidate = ggml_vk_fa_wide_candidate(ctx->device, q, k, v, f32acc);
+    const bool use_dequant_kv = !wide_candidate &&
+                                ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -8180,6 +8291,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+
+    if (wide_candidate && gqa_ratio == 1 && tuning_params.path == FA_COOPMAT1 &&
+        ggml_vk_fa_wide_type_supported(k_type_eff) && ggml_vk_fa_wide_type_supported(v_type_eff)) {
+        tuning_params = get_fa_tuning_params_coopmat1_wide(ctx->device);
+    }
 
     float scale         = 1.0f;
     float max_bias      = 0.0f;

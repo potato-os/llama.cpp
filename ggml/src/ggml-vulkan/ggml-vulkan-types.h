@@ -409,6 +409,7 @@ enum FaCodePath {
     FA_SCALAR,
     FA_COOPMAT1,
     FA_COOPMAT2,
+    FA_COOPMAT1_WIDE, // coopmat1, 16 query rows per subgroup, K/V tiles shared by the workgroup (large batches)
 };
 
 struct vk_fa_pipeline_state {

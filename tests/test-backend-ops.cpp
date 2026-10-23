@@ -12080,6 +12080,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    // large prompt batches with mixed quant KV (Qwen3.x shape: hs 256, 4 KV heads, gqa 6), cache-like
+    // dense layout ({0, 2, 1, 3}, no view) and strided views, partial row tiles and unaligned KV
+    for (int kv : { 512, 1025, 4096 }) {
+        for (int nb : { 64, 75, 512 }) {
+            if (kv == 4096 && nb == 75) continue;
+            for (auto kv_types : std::vector<std::pair<ggml_type, ggml_type>>{ {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0}, {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0} }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kv_types.first, kv_types.second, {0, 2, 1, 3}, false));
+                if (nb != 512) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, kv_types.first, kv_types.second));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 96, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 1024, 96, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 1025, 75, true, true, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {4, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, {0, 2, 1, 3}, false));
+
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -12735,6 +12753,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // Qwen3.x prompt processing at depth with a q8_0/q5_0 cache (cache-like dense layout)
+    for (int kv : { 2048, 33280 }) {
+        for (auto kv_types : std::vector<std::pair<ggml_type, ggml_type>>{ {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0}, {GGML_TYPE_F16, GGML_TYPE_F16} }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, kv_types.first, kv_types.second, {0, 2, 1, 3}, false));
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 512, 576, }) {
