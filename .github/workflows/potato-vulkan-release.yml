@@ -5,6 +5,7 @@ name: Potato release (Vulkan, AMD)
 #  - manual:  Actions -> "Potato release (Vulkan, AMD)" -> Run workflow (optionally with a tag to publish)
 #  - tag:     git tag potato-amd-v1.0.0 && git push origin potato-amd-v1.0.0
 #    (not potato-v*: that prefix starts the CUDA workflow, potato-release.yml)
+#  - branch:  every push to potato-xtx builds and tests; only tags (or a manual run with a tag) publish
 # Every binary is smoke-tested on the runner (no GPU there): version, the Potato flags in --help, a short generation
 # with a tiny model, a llama-server health + completion round trip, and on Windows the serve script.
 
@@ -16,6 +17,8 @@ on:
         required: false
         type: string
   push:
+    branches:
+      - potato-xtx
     tags:
       - 'potato-amd-v*'
 
@@ -248,7 +251,7 @@ jobs:
   release:
     name: publish
     needs: [linux-vulkan, windows-vulkan]
-    if: ${{ github.event_name == 'push' || inputs.tag != '' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/potato-amd-v') || inputs.tag != '' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -263,7 +266,7 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
         run: |
           ls -l dist
           cat dist/*.sha256 > dist/SHA256SUMS.txt
