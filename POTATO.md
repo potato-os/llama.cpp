@@ -7,6 +7,7 @@ needs, built with **Vulkan for AMD Radeon cards** (validated on an RX 7900 XTX).
 | change | what it does |
 |---|---|
 | `--mmproj-swap-draft` | keeps the vision projector off the GPU and, when an image arrives, encodes it on a temporary GPU projector while the MTP draft context releases its VRAM; falls back to the CPU projector when VRAM is still short |
+| Vulkan flash attention, wide-row coopmat1 path for RDNA3 | prompt processing with the q8_0/q5_0 KV cache at long context: +36 % at 32k on an RX 7900 XTX (`GGML_VK_FA_WIDE=0` turns it off) |
 
 The qwen4exp MTP head that Potato-CODER-48GB needs is only on `potato-main`.
 
@@ -19,12 +20,13 @@ needed: the Vulkan loader comes with the GPU driver.
 **Turn on Resizable BAR** (BIOS: "Above 4G Decoding" and "Re-Size BAR Support"; AMD calls it Smart Access Memory). Without
 it, llama.cpp places small device buffers (the recurrent state of this hybrid model) in the 256 MiB CPU-visible window,
 the driver moves them to system memory, and generation runs at about half speed: 20.8 instead of 44.2 tokens/s on an RX
-7900 XTX. If you cannot turn it on, set `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` (42.9 tokens/s on the same card).
+7900 XTX. If you cannot turn it on, start the server with `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` in the environment
+(42.9 tokens/s on the same card; with Resizable BAR on it costs ~3 %, so the Windows serve script always sets it).
 
 Potato-CODER-24GB, one 24 GB Radeon, 262k context, vision and MTP (same flags as on NVIDIA):
 
 ```bash
-GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1 llama-server -m Potato-CODER-24GB-IQ4_XS.gguf \
+llama-server -m Potato-CODER-24GB-IQ4_XS.gguf \
   -c 262144 -ngl 99 -fa on -ctk q8_0 -ctv q5_0 -np 1 -ub 256 -b 2048 --no-context-shift \
   --jinja --chat-template-kwargs '{"preserve_thinking": false}' \
   --mmproj mmproj-Potato-CODER-24GB-Q8_0.gguf --no-mmproj-offload --mmproj-swap-draft \
