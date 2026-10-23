@@ -1,0 +1,298 @@
+name: Potato release (Vulkan, AMD)
+
+# Builds the potato-xtx branch for Linux and Windows (x64, Vulkan) and publishes the archives as a GitHub release.
+# Validated on an AMD Radeon RX 7900 XTX (RDNA3); Vulkan also runs on other AMD, Intel and NVIDIA cards.
+#  - manual:  Actions -> "Potato release (Vulkan, AMD)" -> Run workflow (optionally with a tag to publish)
+#  - tag:     git tag potato-amd-v1.0.0 && git push origin potato-amd-v1.0.0
+#    (not potato-v*: that prefix starts the CUDA workflow, potato-release.yml)
+#  - branch:  every push to potato-xtx builds and tests; only tags (or a manual run with a tag) publish
+# Every binary is smoke-tested on the runner (no GPU there): version, the Potato flags in --help, a short generation
+# with a tiny model, a llama-server health + completion round trip, and on Windows the serve script.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. potato-amd-v1.0.0). Empty = build + test only, artifacts stay on the run.'
+        required: false
+        type: string
+  push:
+    branches:
+      - potato-xtx
+    tags:
+      - 'potato-amd-v*'
+
+concurrency:
+  group: potato-vulkan-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TEST_MODEL_URL: 'https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf'
+  VULKAN_VERSION: 1.4.357.0
+
+jobs:
+  linux-vulkan:
+    name: linux-vulkan (x64)
+    # 22.04 as upstream's release: the LunarG SDK brings a current glslc, and glibc 2.35 runs on most distros
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Dependencies
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev ninja-build jq zip
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: potato-linux-vulkan
+          evict-old-files: 7d
+          max-size: "2G"
+
+      - name: Build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_VULKAN=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build -j $(nproc)
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd build/bin
+          ./llama-server --version
+          ./llama-server --help > help.txt 2>&1 || true
+          grep -q -- '--mmproj-swap-draft' help.txt
+          grep -q 'draft-mtp' help.txt
+          rm help.txt
+          ls libggml-vulkan.so* > /dev/null
+          curl -fsSL -o /tmp/tiny.gguf "$TEST_MODEL_URL"
+          ./llama-completion -m /tmp/tiny.gguf -p "One day, Lily" -n 32 -c 256 -no-cnv --seed 1 | tee /tmp/gen.txt
+          test "$(wc -c < /tmp/gen.txt)" -gt 40
+          GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1 ./llama-server -m /tmp/tiny.gguf -c 256 --port 8099 --no-webui --jinja \
+            --chat-template-kwargs '{"preserve_thinking": false, "reasoning_effort": "medium"}' > /tmp/server.log 2>&1 &
+          SRV=$!
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -fs http://127.0.0.1:8099/health > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          test "$ok" = 1 || { cat /tmp/server.log; exit 1; }
+          curl -fs http://127.0.0.1:8099/completion -d '{"prompt":"One day","n_predict":16}' | jq -e '.content | length > 0'
+          kill $SRV
+
+      - name: Pack
+        shell: bash
+        run: |
+          name=llama-potato-bin-linux-vulkan-x64
+          cp LICENSE build/bin/LICENSE-llama.cpp
+          git rev-parse HEAD > build/bin/POTATO-COMMIT.txt
+          tar -czf $name.tar.gz --transform "s,^\.,$name," -C build/bin .
+          sha256sum $name.tar.gz > $name.tar.gz.sha256
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-potato-bin-linux-vulkan-x64
+          path: |
+            llama-potato-bin-linux-vulkan-*.tar.gz
+            llama-potato-bin-linux-vulkan-*.sha256
+
+  windows-vulkan:
+    name: windows-vulkan (x64)
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: potato-windows-vulkan
+          evict-old-files: 7d
+          max-size: "2G"
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_VULKAN=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON
+          if errorlevel 1 exit /b 1
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location .\build\bin\Release
+          if (-not (Test-Path .\ggml-vulkan.dll)) { throw "ggml-vulkan.dll missing" }
+          .\llama-server.exe --version
+          $help = (& .\llama-server.exe --help 2>&1 | Out-String)
+          if ($help -notmatch '--mmproj-swap-draft') { throw "--mmproj-swap-draft missing from --help" }
+          if ($help -notmatch 'draft-mtp')           { throw "draft-mtp missing from --help" }
+          Invoke-WebRequest -Uri $env:TEST_MODEL_URL -OutFile $env:RUNNER_TEMP\tiny.gguf
+          $gen = (& .\llama-completion.exe -m $env:RUNNER_TEMP\tiny.gguf -p "One day, Lily" -n 32 -c 256 -no-cnv --seed 1 2>$null | Out-String)
+          Write-Host $gen
+          if ($gen.Length -lt 40) { throw "generation too short" }
+          $srv = Start-Process -FilePath .\llama-server.exe -PassThru `
+                   -ArgumentList '-m', "$env:RUNNER_TEMP\tiny.gguf", '-c', '256', '--port', '8099', '--no-webui' `
+                   -RedirectStandardOutput $env:RUNNER_TEMP\srv.out -RedirectStandardError $env:RUNNER_TEMP\srv.err
+          try {
+            $ok = $false
+            foreach ($i in 1..60) {
+              try { Invoke-RestMethod http://127.0.0.1:8099/health | Out-Null; $ok = $true; break } catch { Start-Sleep 1 }
+            }
+            if (-not $ok) { Get-Content $env:RUNNER_TEMP\srv.err; throw "server did not become healthy" }
+            $r = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8099/completion -ContentType 'application/json' -Body '{"prompt":"One day","n_predict":16}'
+            if (-not $r.content) { throw "empty completion" }
+            Write-Host "completion: $($r.content)"
+          } finally {
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Serve script shipped on the model card
+        shell: pwsh
+        run: |
+          # potato/windows/serve-potato-24gb-vulkan.bat is uploaded to the Hugging Face repo as serve-potato-amd.bat.
+          # Case a: empty folder -> clear message, exit 1, no hang (pause reads EOF from stdin).
+          # Case b: binaries but no model -> clear message, exit 1.
+          # Case c: all files present (tiny stand-ins) -> the script launches llama-server.exe with its full argument list;
+          #         every flag must be accepted, and the script must report the stop and return.
+          $ErrorActionPreference = 'Stop'
+          $rel = (Resolve-Path .\build\bin\Release).Path
+          $empty = "$env:RUNNER_TEMP\empty.txt"; Set-Content -Path $empty -Value $null
+          function Invoke-Bat([string]$dir) {
+            $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', "`"$dir\serve-potato-amd.bat`"" -WorkingDirectory $env:RUNNER_TEMP `
+                   -PassThru -RedirectStandardInput $empty -RedirectStandardOutput "$dir.out" -RedirectStandardError "$dir.err"
+            if (-not $p.WaitForExit(180000)) {
+              Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              $p.WaitForExit(); $hung = $true
+            } else { $hung = $false }
+            $out = (Get-Content "$dir.out" -Raw) + (Get-Content "$dir.err" -Raw)
+            return @{ code = $p.ExitCode; out = $out; hung = $hung }
+          }
+          $src = "potato\windows\serve-potato-24gb-vulkan.bat"
+          $files = @('IQ4_XS\Potato-CODER-24GB-IQ4_XS.gguf', 'mmproj-Potato-CODER-24GB-Q8_0.gguf')
+          # a: folder name with spaces and parentheses, like "Downloads (1)"
+          $a = "$env:RUNNER_TEMP\bat amd (a)"; New-Item -ItemType Directory -Force $a | Out-Null
+          Copy-Item $src "$a\serve-potato-amd.bat"
+          $r = Invoke-Bat $a
+          if ($r.hung -or $r.code -ne 1 -or $r.out -notmatch 'not found in') { Write-Host $r.out; throw "case a failed" }
+          # b
+          $b = "$env:RUNNER_TEMP\bat amd (b)"; New-Item -ItemType Directory -Force $b | Out-Null
+          Copy-Item "$rel\*" $b -Recurse; Copy-Item $src "$b\serve-potato-amd.bat"
+          $r = Invoke-Bat $b
+          if ($r.hung -or $r.code -ne 1 -or $r.out -notmatch 'model file not found') { Write-Host $r.out; throw "case b failed" }
+          # c
+          foreach ($f in $files) { New-Item -ItemType Directory -Force (Split-Path "$b\$f") | Out-Null; Copy-Item "$env:RUNNER_TEMP\tiny.gguf" "$b\$f" }
+          $r = Invoke-Bat $b
+          Write-Host "---- case c output (tail)"; ($r.out -split "`n" | Select-Object -Last 15) -join "`n" | Write-Host
+          if ($r.out -notmatch 'Starting Potato-CODER') { throw "case c: the script did not reach llama-server" }
+          if ($r.out -match 'error: invalid argument') { throw "case c: llama-server rejected an argument" }
+          if (-not $r.hung -and $r.out -notmatch 'The server has stopped') { throw "case c: no stop notice" }
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          $name = "llama-potato-bin-win-vulkan-x64"
+          Copy-Item LICENSE .\build\bin\Release\LICENSE-llama.cpp
+          git rev-parse HEAD | Out-File -Encoding ascii .\build\bin\Release\POTATO-COMMIT.txt
+          7z a -snl "$name.zip" .\build\bin\Release\*
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-potato-bin-win-vulkan-x64
+          path: |
+            llama-potato-bin-win-vulkan-*.zip
+            llama-potato-bin-win-vulkan-*.sha256
+
+  release:
+    name: publish
+    needs: [linux-vulkan, windows-vulkan]
+    if: ${{ startsWith(github.ref, 'refs/tags/potato-amd-v') || inputs.tag != '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
+        run: |
+          ls -l dist
+          cat dist/*.sha256 > dist/SHA256SUMS.txt
+          rm dist/*.sha256
+          notes="Vulkan build of \`${GITHUB_SHA}\` for Potato-CODER-24GB on AMD Radeon cards (validated on an RX 7900 XTX).
+
+          - \`linux-vulkan-x64\`: Mesa RADV (any current distro driver), Linux x64.
+          - \`win-vulkan-x64\`: AMD Adrenalin driver, Windows x64.
+
+          Turn on Resizable BAR (Smart Access Memory) in the BIOS. Without it, set \`GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1\` (the Windows serve script does), or generation runs at about half speed.
+
+          See POTATO.md in the repository for the serving flags. NVIDIA users: the CUDA builds are on the \`potato-v*\` releases."
+          # draft first, then one file at a time with retries; the release goes public only when complete
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --draft --title "$TAG" --notes "$notes"
+          fi
+          upload() {
+            for try in 1 2 3 4; do
+              echo "upload $1 (try $try)"
+              if timeout 900 gh release upload "$TAG" "$1" --clobber -R "$GITHUB_REPOSITORY"; then return 0; fi
+              sleep 30
+            done
+            return 1
+          }
+          for f in dist/SHA256SUMS.txt dist/llama-potato-bin-*; do
+            upload "$f" || { echo "upload failed: $f"; exit 1; }
+          done
+          # not --latest: the CUDA release stays the repository's "latest" for the NVIDIA model cards
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest=false
