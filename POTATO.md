@@ -1,16 +1,46 @@
 # llama.cpp for Potato-CODER
 
-This branch (`potato-main`) is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) `master` plus two changes that the
-Potato-CODER models need. Everything else is stock llama.cpp, see [README.md](README.md).
+This branch (`potato-xtx`) is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) `master` plus what Potato-CODER-24GB
+needs, built with **Vulkan for AMD Radeon cards** (validated on an RX 7900 XTX). Everything else is stock llama.cpp, see
+[README.md](README.md). The CUDA builds for NVIDIA cards come from the `potato-main` branch.
 
-| change | what it does | needed by |
-|---|---|---|
-| qwen4exp NextN/MTP draft head | loads the `mtp-*.gguf` draft head of Qwen3.8-Flash-Next models (`--spec-type draft-mtp -md <head>`); squash of upstream PR #28243 by Daniel Han | Potato-CODER-48GB |
-| `--mmproj-swap-draft` | keeps the vision projector off the GPU and, when an image arrives, encodes it on a temporary GPU projector while the MTP draft context releases its VRAM; falls back to the CPU projector when VRAM is still short | both, when the cards are full |
+| change | what it does |
+|---|---|
+| `--mmproj-swap-draft` | keeps the vision projector off the GPU and, when an image arrives, encodes it on a temporary GPU projector while the MTP draft context releases its VRAM; falls back to the CPU projector when VRAM is still short |
 
-The build also compiles the `q8_0`/`q5_0` flash-attention kernel pair that Potato-CODER-24GB serves with.
+The qwen4exp MTP head that Potato-CODER-48GB needs is only on `potato-main`.
 
-## Binaries
+## AMD Radeon (Vulkan)
+
+Binaries: `llama-potato-bin-linux-vulkan-x64.tar.gz` (Linux x64, Mesa RADV) and `llama-potato-bin-win-vulkan-x64.zip`
+(Windows x64, AMD Adrenalin driver) on the [releases page](../../releases), tags `potato-amd-v*`. No runtime archive is
+needed: the Vulkan loader comes with the GPU driver.
+
+**Turn on Resizable BAR** (BIOS: "Above 4G Decoding" and "Re-Size BAR Support"; AMD calls it Smart Access Memory). Without
+it, llama.cpp places small device buffers (the recurrent state of this hybrid model) in the 256 MiB CPU-visible window,
+the driver moves them to system memory, and generation runs at about half speed: 20.8 instead of 44.2 tokens/s on an RX
+7900 XTX. If you cannot turn it on, set `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` (42.9 tokens/s on the same card).
+
+Potato-CODER-24GB, one 24 GB Radeon, 262k context, vision and MTP (same flags as on NVIDIA):
+
+```bash
+GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1 llama-server -m Potato-CODER-24GB-IQ4_XS.gguf \
+  -c 262144 -ngl 99 -fa on -ctk q8_0 -ctv q5_0 -np 1 -ub 256 -b 2048 --no-context-shift \
+  --jinja --chat-template-kwargs '{"preserve_thinking": false}' \
+  --mmproj mmproj-Potato-CODER-24GB-Q8_0.gguf --no-mmproj-offload --mmproj-swap-draft \
+  --spec-type draft-mtp --spec-draft-n-max 3
+```
+
+Build from source (Linux; needs `glslc` and the Vulkan headers, e.g. the LunarG Vulkan SDK):
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+cmake --build build -j --target llama-server
+```
+
+## NVIDIA (CUDA, branch `potato-main`)
+
+### Binaries
 
 Prebuilt zips are on the [releases page](../../releases):
 
@@ -24,7 +54,7 @@ Prebuilt zips are on the [releases page](../../releases):
 If a `cudart-` archive is missing from a release, the `cudart-llama-bin-...` archive of the same CUDA version from the
 [upstream releases](https://github.com/ggml-org/llama.cpp/releases) contains the same libraries.
 
-## Build from source
+### Build from source
 
 Linux:
 
@@ -42,7 +72,7 @@ cmake -B build -G "Ninja Multi-Config" -DGGML_CUDA=ON -DLLAMA_BUILD_BORINGSSL=ON
 cmake --build build --config Release --target llama-server
 ```
 
-## Serving
+### Serving
 
 Potato-CODER-48GB, two 24 GB cards, 262k context, vision and the MTP head:
 
@@ -80,4 +110,5 @@ if the server runs out of memory at start.
 
 ## Updating this branch
 
-`master` of this fork mirrors upstream. `potato-main` is rebased onto it; release tags are `potato-v*`.
+`master` of this fork mirrors upstream. `potato-main` (CUDA) and `potato-xtx` (Vulkan) are rebased onto it; release tags are
+`potato-v*` (CUDA) and `potato-amd-v*` (Vulkan).
